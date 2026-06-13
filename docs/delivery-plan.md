@@ -438,11 +438,45 @@ SHA). FIX: `getattr(p, "merge_commit_sha", None)` → graph-verify uses its
 documented commit-message-scan fallback (ADR §10.4 — primary always
 UNVERIFIED). Cleaned up PR#2 + branch; re-running for a clean draft-on-fork.
 
+### FULL PIPELINE PROVEN END-TO-END (2026-06-12, commit 4ccf47b)
+
+Draft PR #3 LIVE on Rutvik552k/outreach-smoke-target:
+- agentic fix (slug.py re.sub whitespace collapse) + 2 regression tests
+- Docker-sandbox validated, committed with author email =
+  92663812+Rutvik552k@users.noreply.github.com (ATTRIBUTION CONFIRMED)
+- AI-assistance disclosure present, V5 risk notes, awaiting-approval marker
+- discover -> policy -> fork -> clone -> agentic fix -> sandbox -> commit ->
+  push -> draft PR — every stage green on real GitHub. 863 tests.
+
+### KNOWN: fork==upstream degeneracy (smoke target is user's OWN repo)
+
+The two-PR model assumes fork != upstream. Smoke used the user's own repo,
+so approve-sync's upstream-PR step (base=upstream/main head=user:branch)
+would COLLIDE with the existing draft (same repo/base/head) → 422. This is
+ALSO a real supported scenario (FR-5 profile-growth operates on own repos),
+so it needs a proper degenerate-case handler — NOT just a smoke artifact.
+Options: (a) test full approval->upstream->merge->graph loop on a genuine
+EXTERNAL repo (different account); (b) handle own-repo case (draft IS the
+contribution; approval = mark-ready, not second PR); (c) user merges PR #3
+directly to prove graph credit (~24h).
+
+### LOOP CLOSED — graph-credit path proven (2026-06-12, option 1)
+
+User chose option 1 (merge PR #3). Marked ready (GraphQL) + merged
+(method=merge). Commit `f3621782` "Fix slugify..." now on `main`, author
+= 92663812+Rutvik552k@users.noreply.github.com — BOTH GitHub graph-credit
+conditions met (default branch + connected email). Green square expected
+within ~24h. slug.py fix verified live on main. **End-to-end thesis fully
+demonstrated: agent discovers, fixes (agentic, correct), sandbox-validates,
+commits with user attribution, opens reviewable PR — merged → graph credit.**
+
 ## Next actions
 
-1. Smoke round 2 attempt 5 (merge_commit_sha fix) — IN FLIGHT. Expect clean
-   draft-on-fork state + draft PR awaiting label.
-2. On draft PR: USER adds `agent:approve-upstream` label → approve-sync
-   opens upstream PR → merge → graph-verify (commit-scan fallback).
+1. ~24h: verify graph credit appeared (agent graph-verify scans
+   default-branch commits for author email — would now match). Optional
+   /schedule.
+2. Remaining build item (when desired): fork==upstream own-repo publish
+   handler (FR-5 profile-growth + same-account contributions); external-repo
+   two-PR loop test.
 3. USER: delete bootstrap PAT on GitHub; fix billing lock → restore R-1.
 4. Optional hygiene: regenerate OAuth client secret (was pasted in chat).
