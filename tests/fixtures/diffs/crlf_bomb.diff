@@ -1,0 +1,15 @@
+diff --git a/src/widget.py b/src/widget.py
+index 1111111..2222222 100644
+--- a/src/widget.py
++++ b/src/widget.py
+@@ -1,5 +1,5 @@
+-import os
+-import sys
+-
+-def main():
+-    return 0
++import os
++import sys
++
++def main():
++    return 0

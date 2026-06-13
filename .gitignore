@@ -1,0 +1,31 @@
+# Virtual environment
+.venv/
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+
+# Test/tooling caches
+.pytest_cache/
+.coverage
+
+# Runtime artifacts — never commit state or logs (audit DB lives in
+# %LOCALAPPDATA%, but guard against local overrides)
+sandbox-logs/
+*.db
+*.db-wal
+*.db-shm
+
+# Sandbox Phase R artifacts left inside fixture repos by live-lane runs
+.sbx-venv/
+tests/fixtures/repos/*/node_modules/
+tests/fixtures/repos/*/target/
+tests/fixtures/repos/*/package-lock-cache/
+tests/fixtures/repos/*/.cargo-home/
+
+# OS noise
+Thumbs.db
+desktop.ini

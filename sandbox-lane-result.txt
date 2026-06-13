@@ -1,0 +1,16 @@
+﻿============================= test session starts =============================
+platform win32 -- Python 3.12.7, pytest-9.0.3, pluggy-1.6.0 -- C:\Users\rutvi\Downloads\projects\outreach agent\.venv\Scripts\python.exe
+cachedir: .pytest_cache
+rootdir: C:\Users\rutvi\Downloads\projects\outreach agent
+configfile: pyproject.toml
+testpaths: tests
+plugins: anyio-4.13.0, mock-3.15.1
+collecting ... collected 797 items / 792 deselected / 5 selected
+
+tests/test_sandbox_live.py::test_fixture_repo_runs_green_in_real_sandbox[python-pass-python] PASSED [ 20%]
+tests/test_sandbox_live.py::test_fixture_repo_runs_green_in_real_sandbox[nodejs-pass-nodejs] PASSED [ 40%]
+tests/test_sandbox_live.py::test_fixture_repo_runs_green_in_real_sandbox[rust-pass-rust] PASSED [ 60%]
+tests/test_sandbox_live.py::test_hang_fixture_hits_wall_clock_timeout PASSED [ 80%]
+tests/test_sandbox_live.py::test_network_is_disabled_inside_the_execute_sandbox PASSED [100%]
+
+================ 5 passed, 792 deselected in 370.61s (0:06:10) ================

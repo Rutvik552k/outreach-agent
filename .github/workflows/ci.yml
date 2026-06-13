@@ -1,0 +1,69 @@
+# CI gate — closes audit finding H-2 (sign-off conditions C-1 + C-5).
+#
+# Job `test`           : hash-verified install (--require-hashes, C-5) and the
+#                        FULL default pytest lane as a merge-blocking check.
+# Job `c1-structural-incapability`
+#                      : runs tests/test_no_client_outside_gateway.py by
+#                        explicit path. It cannot be deselected silently:
+#                        pytest exits 4 if the file is missing/renamed and 5
+#                        if every test in it is deselected — both non-zero,
+#                        both fail this job. Editing addopts or markers does
+#                        not bypass it.
+#
+# SHA-PINNING NOTE (supply-chain rule): action versions below are pinned by
+# major tag (@v4/@v5) because this workflow was authored offline — there was
+# no network access to resolve and verify the current release commit SHAs.
+# AT FIRST PUSH, replace each tag with the full commit SHA of the verified
+# release (e.g. actions/checkout@<40-hex-sha> # v4.x.y) and keep them
+# SHA-pinned thereafter.
+#
+# Runner is windows-latest: Windows 11 is the project's only supported host
+# (README "Host prerequisites") and requirements.lock was compiled on/for
+# Windows; a Linux runner could resolve a different marker set.
+#
+# After the repo is pushed, mark BOTH jobs as required status checks in
+# branch protection — that is what makes "build-breaking" true (C-1).
+
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: hash-verified install + full default pytest lane
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies (hash-verified, C-5)
+        run: |
+          python -m pip install --require-hashes -r requirements.lock
+          python -m pip install -e . --no-deps
+      - name: Lockfile conformance check
+        run: python scripts/verify_lock.py
+      - name: Full default pytest lane
+        run: python -m pytest -q
+
+  c1-structural-incapability:
+    name: C-1 scanner (explicit, merge-blocking)
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies (hash-verified, C-5)
+        run: |
+          python -m pip install --require-hashes -r requirements.lock
+          python -m pip install -e . --no-deps
+      - name: C-1 structural-incapability scanner
+        run: python -m pytest -q tests/test_no_client_outside_gateway.py

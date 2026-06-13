@@ -1,0 +1,44 @@
+[project]
+name = "outreach-agent"
+version = "0.1.0"
+description = "Local-first GitHub outreach agent (ADR-001 v2)"
+requires-python = ">=3.12"
+dependencies = [
+    "githubkit==0.15.5",
+    "keyring==25.7.0",
+    "anthropic>=0.50",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-mock>=3.14",
+]
+
+[project.scripts]
+outreach-agent = "outreach_agent.cli:main"
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+# Fixture repos under tests/fixtures/repos/ contain their OWN test files
+# (test_add.py, test_hang.py, …) that are meant to run INSIDE the sandbox
+# container via DockerSandboxRunner — never by this project's own pytest.
+# test_hang.py loops forever by design (F-10), so collecting it here would hang
+# the suite. Exclude the entire fixtures tree from collection.
+norecursedirs = ["fixtures"]
+# F-09 test-lane split. The `sandbox` marker is the opt-in live-sandbox lane
+# (ADR §12): it drives the REAL DockerSandboxRunner against the project-owned
+# fixture repos. It is DESELECTED by default so the mocked-CI lane stays
+# hermetic and never needs Docker. Run it explicitly with `pytest -m sandbox`.
+addopts = "-m 'not sandbox'"
+markers = [
+    "sandbox: live-sandbox lane (ADR §12) — runs the real DockerSandboxRunner against fixture repos; deselected by default, needs a running Docker daemon",
+]

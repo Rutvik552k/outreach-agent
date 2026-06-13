@@ -1,0 +1,9 @@
+{
+  "name": "sbx-nodejs-pass",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Sandbox fixture repo (F-08): one passing test via node:test, zero deps so npm ci needs no registry.",
+  "scripts": {
+    "test": "node --test"
+  }
+}
