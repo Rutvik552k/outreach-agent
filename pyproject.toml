@@ -38,7 +38,8 @@ norecursedirs = ["fixtures"]
 # (ADR §12): it drives the REAL DockerSandboxRunner against the project-owned
 # fixture repos. It is DESELECTED by default so the mocked-CI lane stays
 # hermetic and never needs Docker. Run it explicitly with `pytest -m sandbox`.
-addopts = "-m 'not sandbox'"
+addopts = "-m 'not sandbox and not local'"
 markers = [
     "sandbox: live-sandbox lane (ADR §12) — runs the real DockerSandboxRunner against fixture repos; deselected by default, needs a running Docker daemon",
+    "local: opt-in live-host lane (NFR-7) — invokes the REAL claude CLI on the host (subscription); deselected by default, run with `pytest -m local`",
 ]

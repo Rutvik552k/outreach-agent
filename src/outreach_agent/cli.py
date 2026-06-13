@@ -157,10 +157,8 @@ def cmd_discover(db: Database, config: Config) -> int:
 
 def cmd_prepare(db: Database, config: Config) -> int:
     """Prepare the highest-scored cleared candidate (C8 sandbox mandatory)."""
-    from .llm_gateway import AnthropicLLMClient, LLMGateway
     from .prep import SystemGitRunner, prepare_contribution
     from .sandbox import DockerSandboxRunner
-    from .tokens import KeyringTokenSource
 
     row = db.conn.execute(
         "SELECT c.* FROM candidates c"
@@ -189,13 +187,7 @@ def cmd_prepare(db: Database, config: Config) -> int:
                      reason="pre-flight verdict cleared",
                      fields={"fork_full_name": fork_full_name})
 
-    llm = LLMGateway(
-        AnthropicLLMClient(
-            KeyringTokenSource().anthropic_api_key(),
-            timeout_s=config.llm_timeout_s, max_retries=config.llm_max_retries,
-        ),
-        db, config,
-    )
+    llm = _build_llm(db, config)  # NFR-7: backend-aware factory
     sandbox = DockerSandboxRunner(
         image=config.sandbox_image, cpus=config.sandbox_cpus,
         memory=config.sandbox_memory, pids_limit=config.sandbox_pids_limit,
@@ -217,16 +209,12 @@ def cmd_prepare(db: Database, config: Config) -> int:
 
 
 def _build_llm(db: Database, config: Config) -> Any:
-    from .llm_gateway import AnthropicLLMClient, LLMGateway
-    from .tokens import KeyringTokenSource
+    """NFR-7: backend selection lives in build_llm_client. With the default
+    llm_backend=claude-code no Anthropic API key is required — the
+    missing-key CredentialError fires only when llm_backend=anthropic."""
+    from .llm_gateway import LLMGateway, build_llm_client
 
-    return LLMGateway(
-        AnthropicLLMClient(
-            KeyringTokenSource().anthropic_api_key(),
-            timeout_s=config.llm_timeout_s, max_retries=config.llm_max_retries,
-        ),
-        db, config,
-    )
+    return LLMGateway(build_llm_client(config), db, config)
 
 
 def cmd_approve_sync(db: Database, config: Config) -> int:

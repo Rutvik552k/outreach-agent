@@ -132,6 +132,34 @@ class LlmUnavailableError(OutreachError):
     source_component = "llm_gateway"
 
 
+class LlmBackendError(OutreachError):
+    """The configured LLM backend cannot be constructed (NFR-7).
+
+    Raised by the backend factory: unknown ``llm_backend`` value, or
+    backend=claude-code with no ``claude`` CLI on PATH. Non-retriable —
+    fixing it requires operator action (install the CLI / fix config),
+    and ``detail`` always names that action.
+    """
+
+    type_uri = "urn:outreach-agent:error:llm-backend"
+    title = "LLM backend misconfigured or unavailable (NFR-7)"
+    source_component = "llm_gateway"
+
+
+class LlmCliError(OutreachError):
+    """A Claude Code CLI invocation failed (NFR-7).
+
+    Non-zero exit or malformed output: non-retriable by default, because
+    the observed failure modes (bad model, auth/subscription problems)
+    do not heal on retry. Timeouts raise LlmUnavailableError instead
+    (retriable=True) — slow/overloaded service is the retriable cause.
+    """
+
+    type_uri = "urn:outreach-agent:error:llm-cli"
+    title = "Claude Code CLI invocation failed (NFR-7)"
+    source_component = "llm_gateway"
+
+
 class GitOperationError(OutreachError):
     type_uri = "urn:outreach-agent:error:git-operation"
     title = "Local git operation failed"

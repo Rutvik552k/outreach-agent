@@ -36,6 +36,14 @@ class Config:
     triage_model: str = "claude-haiku-4-5"
     llm_timeout_s: int = 120
     llm_monthly_spend_cap_usd: float = 60.0
+    # NFR-7 (user decision 2026-06-12): default generation backend is the
+    # Claude Code CLI on the host (subscription, headless `claude -p`);
+    # "anthropic" remains available when an API key is stored in the keyring.
+    # The F-13 monthly spend cap gates the anthropic backend ONLY — the
+    # claude-code backend is subscription-backed and records 0-cost entries.
+    llm_backend: str = "claude-code"  # ∈ {"claude-code", "anthropic"}
+    claude_cli_executable: str = "claude"
+    claude_cli_timeout_s: int = 300
     # §5 self-imposed caps (~10% of platform secondary limits)
     content_creation_per_min: int = 8
     content_creation_per_hr: int = 50

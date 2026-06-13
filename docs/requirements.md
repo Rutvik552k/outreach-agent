@@ -115,6 +115,12 @@ success metric.
 - **NFR-6 LLM safety**: generated code/text must pass repo tests + lint
   before approval queue; prompts never contain secrets; AI disclosure
   mandatory in PR text.
+- **NFR-7 LLM backend choice (user decision 2026-06-12)**: Anthropic API
+  key is OPTIONAL. Default generation backend = Claude Code CLI installed
+  on the host (headless `claude -p`), using the user's existing
+  subscription — no separate API spend. Anthropic API backend remains as
+  config option when a key is stored. All NFR-6 safety rules apply to both
+  backends identically.
 
 ## Acceptance criteria (MVP)
 

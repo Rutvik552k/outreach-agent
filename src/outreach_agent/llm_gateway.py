@@ -14,13 +14,24 @@ SQLite ledger checked BEFORE each call (F-13 hard stop → llm-blocked).
 
 from __future__ import annotations
 
+import json
+import os
 import re
+import shutil
+import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Protocol
 
 from .config import Config
-from .errors import LlmBudgetError, LlmUnavailableError, SecretLeakError
+from .errors import (
+    LlmBackendError,
+    LlmBudgetError,
+    LlmCliError,
+    LlmUnavailableError,
+    SecretLeakError,
+)
 from .outbound_safety import (
     loaded_secret_values,
     normalize_outbound_text,
@@ -94,6 +105,152 @@ class AnthropicLLMClient:
         )
 
 
+def _default_scratch_dir() -> Path:
+    local = os.environ.get("LOCALAPPDATA")
+    base = Path(local) if local else Path.home() / "AppData" / "Local"
+    return base / "outreach-agent" / "claude-scratch"
+
+
+class ClaudeCodeLLMClient:
+    """NFR-7 default backend: headless Claude Code CLI (`claude -p`) on the
+    host, riding the user's subscription — no API key required.
+
+    Ground source (verified on the LOCAL install, 2026-06-12, zero web):
+    `claude --help` confirms `-p/--print` (non-interactive), `--output-format
+    json|text` (print-only), `--model <model>`, `--system-prompt <prompt>`,
+    `--tools ""` (disable all tools), `--disable-slash-commands`,
+    `--no-session-persistence`. A live probe (`"Reply with exactly: OK" |
+    claude -p --output-format json ...`) confirmed: prompt is read from
+    stdin; output is one JSON object with `result` (text), `is_error`,
+    `subtype`, and `usage.input_tokens`/`usage.output_tokens`; exit code 0.
+    A failure probe (bogus `--model`) confirmed: exit code 1 with a one-line
+    diagnostic. `claude` resolves to a native `claude.exe` (not a .cmd
+    shim), so list-argv CreateProcess escaping is safe.
+
+    Injection containment (decision): the subprocess cwd is a dedicated
+    EMPTY scratch directory, never the repo work dir. Claude Code
+    auto-discovers CLAUDE.md/settings from its cwd — running it inside a
+    cloned third-party repo would let that repo's CLAUDE.md steer
+    generation (prompt-injection vector). Defence in depth: `--tools ""`,
+    `--disable-slash-commands`, and `--no-session-persistence` reduce the
+    CLI to pure text generation. `--bare` is deliberately NOT used: its
+    help states OAuth/keychain auth is never read under --bare, which
+    would break the subscription auth NFR-7 exists to use.
+
+    Notes:
+    - The prompt goes via STDIN (never argv) so it stays out of process
+      lists; only the agent-authored system template rides argv.
+    - `max_tokens` is accepted for protocol compatibility but the CLI
+      exposes no output-token cap flag (verified in --help); it is not
+      enforced on this backend.
+    - `subscription_backed = True`: the gateway records 0-cost ledger
+      entries (calls + reported tokens kept for observability) and the
+      F-13 monthly spend cap does not gate this backend.
+    """
+
+    subscription_backed = True
+
+    def __init__(self, executable: str, *, timeout_s: float,
+                 scratch_dir: Path | None = None) -> None:
+        self._executable = executable
+        self._timeout_s = timeout_s
+        # Created lazily at call time, not construction time, so building
+        # the client (e.g. in the factory) never touches the filesystem.
+        self._scratch_dir = scratch_dir or _default_scratch_dir()
+
+    def _argv(self, *, model: str, system: str) -> list[str]:
+        return [
+            self._executable, "-p",
+            "--output-format", "json",
+            "--model", model,
+            "--system-prompt", system,
+            "--tools", "",
+            "--disable-slash-commands",
+            "--no-session-persistence",
+        ]
+
+    def complete(self, *, model: str, system: str, prompt: str,
+                 max_tokens: int) -> LLMCompletion:
+        argv = self._argv(model=model, system=system)
+        self._scratch_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            proc = subprocess.run(
+                argv,
+                input=prompt,                # stdin — never argv (verified)
+                capture_output=True, text=True,
+                # CLI output is UTF-8; never decode as the Windows locale
+                # codec (cp1252 trap — same rationale as sandbox.py).
+                encoding="utf-8", errors="replace",
+                timeout=self._timeout_s,
+                cwd=str(self._scratch_dir),  # injection containment, see above
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise LlmUnavailableError(
+                f"claude CLI timed out after {self._timeout_s}s (retriable)"
+            ) from exc
+        except OSError as exc:
+            raise LlmBackendError(
+                f"failed to launch claude CLI at {self._executable!r}: {exc}"
+            ) from exc
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+            raise LlmCliError(
+                f"claude CLI exited {proc.returncode}: "
+                f"{detail[0][:300] if detail else '<no output>'}"
+            )
+        try:
+            data = json.loads(proc.stdout)
+        except ValueError as exc:
+            raise LlmCliError(
+                "claude CLI returned non-JSON output despite "
+                "--output-format json (first 200 chars: "
+                f"{proc.stdout[:200]!r})"
+            ) from exc
+        if data.get("is_error"):
+            raise LlmCliError(
+                f"claude CLI reported an error result "
+                f"(subtype={data.get('subtype')!r})"
+            )
+        usage = data.get("usage") or {}
+        return LLMCompletion(
+            text=str(data.get("result") or ""),
+            input_tokens=int(usage.get("input_tokens") or 0),
+            output_tokens=int(usage.get("output_tokens") or 0),
+        )
+
+
+def build_llm_client(config: Config, token_source=None) -> LLMClient:
+    """NFR-7 backend factory — the single place backend selection happens.
+
+    claude-code (default): requires the `claude` CLI on PATH; no API key.
+    anthropic: requires the keyring-stored API key (CredentialError with
+    remediation if absent — the key is OPTIONAL overall per NFR-7).
+    """
+    backend = config.llm_backend
+    if backend == "claude-code":
+        exe = shutil.which(config.claude_cli_executable)
+        if exe is None:
+            raise LlmBackendError(
+                f"llm_backend=claude-code but {config.claude_cli_executable!r} "
+                "was not found on PATH; install Claude Code "
+                "(https://claude.com/claude-code, e.g. `npm install -g "
+                "@anthropic-ai/claude-code`) or set llm_backend=anthropic"
+            )
+        return ClaudeCodeLLMClient(exe, timeout_s=config.claude_cli_timeout_s)
+    if backend == "anthropic":
+        if token_source is None:
+            from .tokens import KeyringTokenSource
+            token_source = KeyringTokenSource()
+        return AnthropicLLMClient(
+            token_source.anthropic_api_key(),
+            timeout_s=config.llm_timeout_s,
+            max_retries=config.llm_max_retries,
+        )
+    raise LlmBackendError(
+        f"unknown llm_backend {backend!r}; expected 'claude-code' or 'anthropic'"
+    )
+
+
 class FakeLLMClient:
     """Test seam: canned completions; records every request."""
 
@@ -152,10 +309,17 @@ class LLMGateway:
             )
 
     def _record_spend(self, *, model: str, purpose: str,
-                      completion: LLMCompletion) -> float:
-        p_in, p_out = self._price(model)
-        cost = (completion.input_tokens / 1e6) * p_in \
-            + (completion.output_tokens / 1e6) * p_out
+                      completion: LLMCompletion,
+                      zero_cost: bool = False) -> float:
+        # NFR-7: subscription-backed backends (claude-code) record 0-cost
+        # entries — the call and reported tokens are still ledgered for
+        # observability, but no dollars accrue toward the F-13 cap.
+        if zero_cost:
+            cost = 0.0
+        else:
+            p_in, p_out = self._price(model)
+            cost = (completion.input_tokens / 1e6) * p_in \
+                + (completion.output_tokens / 1e6) * p_out
         with self.db.transaction():
             self.db.conn.execute(
                 "INSERT INTO llm_spend(entry_id, ts, model, purpose, input_tokens,"
@@ -195,10 +359,18 @@ class LLMGateway:
                  max_tokens: int | None = None) -> str:
         model = model or self.config.model
         max_tokens = max_tokens or self.config.llm_max_output_tokens
+        # NFR-6/NFR-7: the outbound secret check is backend-agnostic — it
+        # runs HERE, before ANY client (API call or CLI subprocess) sees
+        # the text. Fail-closed for every backend identically.
         self.assert_no_secrets(system, prompt)
-        self._assert_budget()
+        # F-13: the monthly spend cap gates API-spend backends only; a
+        # subscription-backed client (claude-code) spends no API dollars.
+        subscription = bool(getattr(self.client, "subscription_backed", False))
+        if not subscription:
+            self._assert_budget()
         completion = self.client.complete(
             model=model, system=system, prompt=prompt, max_tokens=max_tokens,
         )
-        self._record_spend(model=model, purpose=purpose, completion=completion)
+        self._record_spend(model=model, purpose=purpose, completion=completion,
+                           zero_cost=subscription)
         return completion.text
