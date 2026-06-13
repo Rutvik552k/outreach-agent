@@ -9,12 +9,13 @@ policy-cleared and cleans the work dir; spend-cap → llm-blocked (FM9).
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Callable, Protocol
 
 from .config import Config
 from .contracts import PreparedContribution, PrText
@@ -124,14 +125,77 @@ class GitRunner(Protocol):
     def run(self, args: list[str], *, cwd: Path | None = None) -> str: ...
 
 
+# Env var the credential helper reads the token from. Set in the SUBPROCESS
+# env ONLY (a copy of os.environ) — never exported into the parent process,
+# never persisted. The helper script below references it as $OUTREACH_GIT_TOKEN
+# so the token value never appears in argv (invisible to `ps`/process listing),
+# never in the remote URL, and never in .git/config.
+_GIT_TOKEN_ENV_VAR = "OUTREACH_GIT_TOKEN"
+
+# `-c credential.helper=` (empty) FIRST clears any inherited helper (the system
+# config ships `credential.helper=manager`, the Git Credential Manager that
+# caused the original "Password authentication is not supported" failure by
+# using ambient OS creds instead of our token). The second `-c` then installs a
+# one-shot inline helper that prints username/password to git on stdout. The
+# username `x-access-token` + the OAuth token as password is GitHub's documented
+# token-as-password convention and was verified empirically against a real push
+# in this environment (gho_ user-to-server token, 2026-06-12: branch pushed then
+# deleted on Rutvik552k/outreach-smoke-target; .git/config confirmed token-free).
+_GIT_CREDENTIAL_HELPER = (
+    "!f() { "
+    "echo username=x-access-token; "
+    f"echo password=${_GIT_TOKEN_ENV_VAR}; "
+    "}; f"
+)
+
+
+def _needs_token(args: list[str]) -> bool:
+    """Only authenticated mutations to github.com need the token. `push` is the
+    only such operation prep/publisher issue (clone/fetch of public forks work
+    unauthenticated). Injecting auth on push is harmless even when unneeded
+    because it is leak-safe; scoping it keeps the credential surface minimal."""
+    return bool(args) and args[0] == "push"
+
+
 class SystemGitRunner:
-    """Shells out to system git. Raises GitOperationError on non-zero exit."""
+    """Shells out to system git. Raises GitOperationError on non-zero exit.
+
+    NFR-3 (token-leak-safe github.com auth): when constructed with a
+    ``token_provider`` callable, an authenticated operation (``push``) is run
+    with an env-var-fed inline credential helper so the OAuth token reaches git
+    via the subprocess environment ONLY — never via argv, the remote URL, or
+    ``.git/config``. The default (no provider) preserves the original bare-git
+    behavior, so ``FakeGitRunner`` and every existing test are unaffected.
+    """
+
+    def __init__(self, token_provider: Callable[[], str] | None = None) -> None:
+        # Lazy: the provider is called only when an operation actually needs a
+        # token (a push), so unauthenticated clones never touch the keyring and
+        # a missing token surfaces as a typed CredentialError at push time.
+        self._token_provider = token_provider
 
     def run(self, args: list[str], *, cwd: Path | None = None) -> str:
+        git_args = list(args)
+        env: dict[str, str] | None = None
+        if self._token_provider is not None and _needs_token(args):
+            token = self._token_provider()  # CredentialError if missing (typed)
+            # Token lives ONLY in the subprocess env (copy of os.environ); the
+            # parent process env is never mutated and nothing is persisted.
+            env = {**os.environ, _GIT_TOKEN_ENV_VAR: token}
+            # The `-c` flags carry the helper SCRIPT (which references the env
+            # var by name), not the token value — argv stays token-free.
+            git_args = [
+                "-c", "credential.helper=",
+                "-c", f"credential.helper={_GIT_CREDENTIAL_HELPER}",
+                *args,
+            ]
         proc = subprocess.run(
-            ["git", *args], cwd=cwd, capture_output=True, text=True, timeout=600,
+            ["git", *git_args], cwd=cwd, capture_output=True, text=True,
+            timeout=600, env=env,
         )
         if proc.returncode != 0:
+            # stderr cannot contain the token: it is never in argv/url, and git's
+            # auth-failure messages echo neither the helper output nor the env.
             raise GitOperationError(
                 f"git {' '.join(args[:3])}... exited {proc.returncode}: "
                 f"{proc.stderr.strip()[:400]}"

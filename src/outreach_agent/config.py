@@ -25,7 +25,16 @@ class Config:
     # network on) and Phase X (execute, network none) each get their own kill.
     sandbox_wall_timeout_s: int = 900
     sandbox_resolve_timeout_s: int = 300
-    sandbox_image: str = "outreach-agent-sandbox:latest"
+    # Per-stack toolchain-bearing base images (the live sandbox lane proved
+    # these official tags work two-phase). `prepare` handles one candidate, so
+    # the image is resolved from that candidate's stack via image_for_stack().
+    # react reuses the node toolchain (identical command vector).
+    sandbox_images: tuple[tuple[str, str], ...] = (
+        ("python", "python:3.12-slim"),
+        ("nodejs", "node:20-slim"),
+        ("react", "node:20-slim"),
+        ("rust", "rust:1-slim"),
+    )
     sandbox_cpus: str = "2"
     sandbox_memory: str = "2g"
     sandbox_pids_limit: int = 256
@@ -106,6 +115,17 @@ class Config:
     oauth_listener_timeout_s: int = 180
     # §6 graph-verify
     graph_verify_delay_h: int = 24
+
+    def image_for_stack(self, stack: str) -> str:
+        """Resolve the sandbox base image for a candidate's stack (C8). Raises
+        on an unknown stack rather than silently using a wrong toolchain."""
+        for name, image in self.sandbox_images:
+            if name == stack:
+                return image
+        raise KeyError(
+            f"no sandbox image configured for stack {stack!r}; "
+            f"known: {[n for n, _ in self.sandbox_images]}"
+        )
 
 
 def _dropbox_roots(env: dict[str, str]) -> list[Path]:

@@ -16,6 +16,7 @@ from outreach_agent.prep import FakeGitRunner, build_pr_text
 from outreach_agent.publisher import (
     check_merge_rate_pause,
     run_graph_verification,
+    select_author_email,
     submit_for_approval,
     sync_approval,
     sync_outcome,
@@ -43,17 +44,23 @@ def store(db: Database) -> ContributionStore:
     return ContributionStore(db)
 
 
+NOREPLY = "12345+rutvik@users.noreply.github.com"
+
+
 def _to_draft(store: ContributionStore, gateway: GitHubGateway,
               db: Database, config: Config) -> str:
     cid = store.create(candidate_id=None, repo_full_name=UPSTREAM)
     for s in (State.SCORED, State.POLICY_CLEARED, State.PREPARED, State.CI_GREEN):
         store.transition(cid, s)
-    git = FakeGitRunner()
+    # rev-list returns ≥1 so the empty-commit guard passes.
+    git = FakeGitRunner({"rev-list": "1\n"})
     number = submit_for_approval(
         db=db, store=store, gateway=gateway, git=git, config=config,
         contribution_id=cid, prepared=_prepared(cid),
         fork_full_name=FORK, fork_default_branch="main",
-        upstream_full_name=UPSTREAM, work_dir=None,
+        upstream_full_name=UPSTREAM,
+        commit_author_email=NOREPLY, commit_author_name="rutvik",
+        work_dir=None,
     )
     assert number == 7
     push = next(args for args, _ in git.calls if args[0] == "push")
@@ -79,9 +86,123 @@ def test_push_refuses_unpinned_branch_shape(store: ContributionStore,
             db=db, store=store, gateway=gateway, git=git, config=config,
             contribution_id=cid, prepared=bad,
             fork_full_name=FORK, fork_default_branch="main",
-            upstream_full_name=UPSTREAM, work_dir=None,
+            upstream_full_name=UPSTREAM,
+            commit_author_email=NOREPLY, commit_author_name="rutvik",
+            work_dir=None,
         )
     assert git.calls == []
+
+
+# ---------------------------------------------------------------------------
+# Commit step: author-email attribution, ordering, and the empty-commit guard
+# ---------------------------------------------------------------------------
+
+
+def test_select_author_email_prefers_noreply() -> None:
+    """ATTRIBUTION: a *@users.noreply.github.com entry is preferred over a plain
+    address (privacy + always graph-valid). Author email decides graph credit
+    (ADR-001 §2[5]/§6)."""
+    assert select_author_email(
+        "plain@example.com, 42+me@users.noreply.github.com, other@x.com"
+    ) == "42+me@users.noreply.github.com"
+
+
+def test_select_author_email_falls_back_to_first() -> None:
+    """No noreply entry → the first configured email (semicolon also splits)."""
+    assert select_author_email("first@example.com; second@example.com") \
+        == "first@example.com"
+
+
+def test_select_author_email_unset_raises_typed_error() -> None:
+    """Empty/unset user_emails → typed AttributionConfigError with remediation,
+    never a silent unattributed commit."""
+    from outreach_agent.errors import AttributionConfigError
+
+    for value in (None, "", "  ,  ; "):
+        with pytest.raises(AttributionConfigError) as ei:
+            select_author_email(value)
+        assert "user_emails" in str(ei.value)
+
+
+def test_submit_commits_with_author_email_before_push_in_order(
+        store: ContributionStore, gateway: GitHubGateway,
+        db: Database, config: Config) -> None:
+    """The publish path stages (`add -A`) then commits with the AUTHOR email set
+    via the per-command `-c user.email=` form (never global git config), and
+    both happen BEFORE the push."""
+    cid = store.create(candidate_id=None, repo_full_name=UPSTREAM)
+    for s in (State.SCORED, State.POLICY_CLEARED, State.PREPARED, State.CI_GREEN):
+        store.transition(cid, s)
+    git = FakeGitRunner({"rev-list": "2\n"})
+    submit_for_approval(
+        db=db, store=store, gateway=gateway, git=git, config=config,
+        contribution_id=cid, prepared=_prepared(cid),
+        fork_full_name=FORK, fork_default_branch="main",
+        upstream_full_name=UPSTREAM,
+        commit_author_email=NOREPLY, commit_author_name="rutvik",
+        work_dir=None,
+    )
+    calls = [args for args, _ in git.calls]
+    add_i = next(i for i, a in enumerate(calls) if a and a[0] == "add" and a[1] == "-A")
+    commit_call = next(a for a in calls if "commit" in a)
+    commit_i = calls.index(commit_call)
+    push_i = next(i for i, a in enumerate(calls) if a and a[0] == "push")
+    assert add_i < commit_i < push_i
+    # author email set via -c (per-command, NOT global config) — token/committer
+    # identity does NOT decide graph credit; author email does.
+    assert f"user.email={NOREPLY}" in commit_call
+    assert "user.name=rutvik" in commit_call
+    assert commit_call[commit_call.index("-m") + 1] == "Fix crash"  # PR title
+
+
+def test_submit_empty_commit_guard_blocks_push(
+        store: ContributionStore, gateway: GitHubGateway,
+        db: Database, config: Config) -> None:
+    """rev-list count 0 (the model produced no working-tree change) → typed
+    EmptyCommitError and NO push (would otherwise 422 'No commits between')."""
+    from outreach_agent.errors import EmptyCommitError
+
+    cid = store.create(candidate_id=None, repo_full_name=UPSTREAM)
+    for s in (State.SCORED, State.POLICY_CLEARED, State.PREPARED, State.CI_GREEN):
+        store.transition(cid, s)
+    git = FakeGitRunner({"rev-list": "0\n"})
+    with pytest.raises(EmptyCommitError) as ei:
+        submit_for_approval(
+            db=db, store=store, gateway=gateway, git=git, config=config,
+            contribution_id=cid, prepared=_prepared(cid),
+            fork_full_name=FORK, fork_default_branch="main",
+            upstream_full_name=UPSTREAM,
+            commit_author_email=NOREPLY, commit_author_name="rutvik",
+            work_dir=None,
+        )
+    assert "no commits" in str(ei.value).lower()
+    assert not any(a and a[0] == "push" for a, _ in git.calls)
+
+
+def test_submit_refuses_staged_config_file(
+        store: ContributionStore, gateway: GitHubGateway,
+        db: Database, config: Config) -> None:
+    """Defence-in-depth: if `git add -A` stages a stripped agent-config file
+    (the C-2 restore failed), the commit is refused before it is authored."""
+    from outreach_agent.errors import GitOperationError
+
+    cid = store.create(candidate_id=None, repo_full_name=UPSTREAM)
+    for s in (State.SCORED, State.POLICY_CLEARED, State.PREPARED, State.CI_GREEN):
+        store.transition(cid, s)
+    # `git diff --cached --name-only` reports a deny-listed config file staged.
+    git = FakeGitRunner({"diff": "src/lib.py\nCLAUDE.md\n", "rev-list": "1\n"})
+    with pytest.raises(GitOperationError) as ei:
+        submit_for_approval(
+            db=db, store=store, gateway=gateway, git=git, config=config,
+            contribution_id=cid, prepared=_prepared(cid),
+            fork_full_name=FORK, fork_default_branch="main",
+            upstream_full_name=UPSTREAM,
+            commit_author_email=NOREPLY, commit_author_name="rutvik",
+            work_dir=None,
+        )
+    assert "CLAUDE.md" in str(ei.value)
+    assert not any("commit" in a for a, _ in git.calls)
+    assert not any(a and a[0] == "push" for a, _ in git.calls)
 
 
 def _label_event(name: str, actor: str, event_id: int = 100) -> dict[str, Any]:

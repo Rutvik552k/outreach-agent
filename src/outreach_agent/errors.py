@@ -199,6 +199,37 @@ class GitOperationError(OutreachError):
     source_component = "prep"
 
 
+class EmptyCommitError(OutreachError):
+    """The agent branch carries no commits over its base (silently-empty fix).
+
+    Raised in the publish path when `git rev-list --count <base>..HEAD` is 0
+    after the commit step — the model produced no working-tree change, so a
+    push would point the branch at the fork default branch and GitHub would
+    reject the PR with 422 "No commits between". Surfacing this as a typed,
+    non-retriable error makes the empty-fix case diagnosable and distinct from
+    auth/PR-create failures."""
+
+    type_uri = "urn:outreach-agent:error:empty-commit"
+    title = "Agent branch has no commits over its base (empty fix)"
+    source_component = "publisher"
+
+
+class AttributionConfigError(OutreachError):
+    """No commit-author email is configured (attribution would be lost).
+
+    Raised when the publish path cannot resolve a connected/noreply email to
+    author the commit with. Author email — not the committer or the OAuth
+    token identity — is what GitHub counts for contribution-graph credit
+    (ADR-001 §2[5], §6 graph-verify; troubleshooting-missing-contributions),
+    so committing without it would silently forfeit graph credit. Non-retriable:
+    fixing it requires setting the `user_emails` config_meta key; ``detail``
+    names that action."""
+
+    type_uri = "urn:outreach-agent:error:attribution-config"
+    title = "Commit-author email not configured (NFR / F-01 attribution)"
+    source_component = "publisher"
+
+
 class OAuthError(OutreachError):
     type_uri = "urn:outreach-agent:error:oauth"
     title = "OAuth login flow failed (V6 hardening enforced)"

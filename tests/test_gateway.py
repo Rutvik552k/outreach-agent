@@ -67,6 +67,56 @@ def test_mutation_failure_audits_failed(gateway: GitHubGateway,
         ["intent", "failed"]
 
 
+def _request_failed_422(message: str, error_message: str) -> Exception:
+    """A real githubkit RequestFailed whose response body carries GitHub's
+    Problem-Details (message + errors[]) — the exact 422 shape PR-create returns
+    when the branch has no commits over base. Ground truth: githubkit 0.15.5
+    exception.py:53-72 (RequestFailed wraps the response; __repr__ shows only
+    status, body lives in response.raw_response.json())."""
+    import httpx
+    from githubkit.exception import RequestFailed
+
+    req = httpx.Request("POST", "https://api.github.com/repos/o/r/pulls")
+    body = (
+        b'{"message":"%b","errors":[{"resource":"PullRequest","code":"custom",'
+        b'"message":"%b"}]}' % (message.encode(), error_message.encode())
+    )
+    raw = httpx.Response(422, request=req, content=body)
+
+    class _Resp:
+        raw_request = req
+        raw_response = raw
+        _status_reason = "422 Unprocessable Entity"
+
+    return RequestFailed(_Resp())
+
+
+def test_pr_create_422_surfaces_no_commits_message(
+        gateway: GitHubGateway, fake_client: FakeGitHubClient,
+        db: Database) -> None:
+    """REQ-1: a 422 ValidationError on PR-create must surface GitHub's body
+    ("No commits between ...") into BOTH the raised error and the failed-audit
+    record — never a bare 422. str(RequestFailed) is useless and its repr omits
+    the body, so the gateway extracts response.raw_response.json()."""
+    fake_client.fail_next = _request_failed_422(
+        "Validation Failed", "No commits between main and agent/12-fix")
+    with pytest.raises(GitHubMutationError) as ei:
+        gateway.create_draft_pr_on_fork(
+            fork_full_name=FORK, head_branch="agent/12-fix", base_branch="main",
+            title="t", body="b",
+        )
+    # the actionable diagnosis is in the raised error
+    msg = str(ei.value)
+    assert "No commits between main and agent/12-fix" in msg
+    assert "HTTP 422" in msg and "Validation Failed" in msg
+    # ...and persisted in the failed-audit outcome for post-hoc diagnosis
+    row = db.conn.execute(
+        "SELECT outcome_json FROM audit_log"
+        " WHERE endpoint='POST /repos/{fork_owner}/{fork}/pulls' AND phase='failed'"
+    ).fetchone()
+    assert "No commits between main and agent/12-fix" in row["outcome_json"]
+
+
 def test_get_issue_is_a_read_no_budget_no_audit(gateway: GitHubGateway,
                                                 fake_client: FakeGitHubClient,
                                                 db: Database) -> None:

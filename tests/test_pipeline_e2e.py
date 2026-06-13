@@ -94,14 +94,31 @@ def test_full_pipeline_discovered_to_upstream_open(
     assert prepared is not None
     assert "AI-assistance disclosure" in prepared.pr_text.body_md  # NFR-6
 
-    # -- [4] approval flow: intra-fork draft PR ---------------------------------
+    # -- [4] approval flow: COMMIT the validated fix + intra-fork draft PR -------
+    # The same FakeGitRunner answers rev-list with the GOOD_DIFF/diff key set in
+    # prep; add rev-list → "1" so the empty-commit guard passes (the branch has
+    # the fix commit over base_sha).
+    git.outputs["rev-list"] = "1\n"
     draft_number = submit_for_approval(
         db=db, store=store, gateway=gateway, git=git, config=config,
         contribution_id=cid, prepared=prepared,
         fork_full_name=FORK, fork_default_branch="main",
-        upstream_full_name=UPSTREAM, work_dir=None,
+        upstream_full_name=UPSTREAM,
+        commit_author_email="9+rutvik@users.noreply.github.com",
+        commit_author_name=FORK_OWNER,
+        work_dir=None,
     )
     assert store.get_state(cid) == State.DRAFT_ON_FORK
+
+    # the commit step ran add → commit (author email set) BEFORE push, in order.
+    # The commit is issued as `-c user.name=.. -c user.email=.. commit -m ..`, so
+    # locate it by the "commit" token inside the args tuple.
+    all_calls = [args for args, _ in git.calls]
+    add_i = next(i for i, a in enumerate(all_calls) if a and a[0] == "add")
+    commit_i = next(i for i, a in enumerate(all_calls) if "commit" in a)
+    push_i = next(i for i, a in enumerate(all_calls) if a and a[0] == "push")
+    assert add_i < commit_i < push_i
+    assert "user.email=9+rutvik@users.noreply.github.com" in all_calls[commit_i]
 
     # human approves on github.com (timeline event by the fork owner)
     fake_client.timeline = [

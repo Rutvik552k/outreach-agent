@@ -277,13 +277,20 @@ def test_prepare_ends_at_draft_on_fork_with_fork_default_branch(
     from outreach_agent import prep, sandbox
 
     _seed_cleared_candidate(db, repo_full_name=UPSTREAM)
+    # ATTRIBUTION: cmd_prepare resolves the commit-author email from this
+    # config_meta key; the noreply entry is preferred for graph credit.
+    db.set_meta("user_emails", "plain@example.com,77+rutvik@users.noreply.github.com")
     fake_client.default_branches[FORK] = "trunk"
     fake_client.pull_response = make_pull_ref(
         number=77, state="open", draft=True,
         base_repo_full_name=FORK, head_repo_full_name=FORK,
     )
-    fake_git = FakeGitRunner()
-    monkeypatch.setattr(prep, "SystemGitRunner", lambda: fake_git)
+    # rev-list returns ≥1 so submit_for_approval's empty-commit guard passes.
+    fake_git = FakeGitRunner({"rev-list": "1\n"})
+    # cli.py now constructs SystemGitRunner(token_provider=...) for NFR-3
+    # github.com push auth; the stub accepts and ignores it (FakeGitRunner
+    # needs no token — it records calls without shelling out).
+    monkeypatch.setattr(prep, "SystemGitRunner", lambda **_: fake_git)
     monkeypatch.setattr(sandbox, "DockerSandboxRunner",
                         lambda **kw: object())  # never used by the fake prep
 
@@ -305,6 +312,16 @@ def test_prepare_ends_at_draft_on_fork_with_fork_default_branch(
     pushes = [c for c in fake_git.calls if c[0][0] == "push"]
     assert len(pushes) == 1
     assert pushes[0][0] == ("push", "origin", "--", "agent/12-fix")
+    # COMMIT ran before push, authored with the NOREPLY email (preferred over
+    # the plain address) — author email decides graph credit (ADR-001 §2[5]).
+    seq = [c[0] for c in fake_git.calls]
+    add_i = next(i for i, a in enumerate(seq) if a and a[0] == "add")
+    commit_i = next(i for i, a in enumerate(seq) if "commit" in a)
+    push_i = next(i for i, a in enumerate(seq) if a and a[0] == "push")
+    assert add_i < commit_i < push_i
+    assert "user.email=77+rutvik@users.noreply.github.com" in seq[commit_i]
+    # commit subject derived from the generated PR title
+    assert seq[commit_i][seq[commit_i].index("-m") + 1] == "Fix crash"
     # draft PR created on the FORK with its real default branch as base
     fork_pulls = [p for p in fake_client.created_pulls
                   if f"{p['owner']}/{p['repo']}" == FORK]

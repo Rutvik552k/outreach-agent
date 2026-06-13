@@ -19,7 +19,12 @@ from typing import Any, Callable
 from .approval import pre_publish_gate, scan_timeline
 from .config import Config
 from .contracts import PreparedContribution
-from .errors import BudgetDeniedError
+from .errors import (
+    AttributionConfigError,
+    BudgetDeniedError,
+    EmptyCommitError,
+    GitOperationError,
+)
 from .github_gateway import GitHubGateway
 from .graph_verify import GraphVerdict, verify_graph_credit
 from .persistence import Database, new_ulid, utc_now_iso
@@ -27,6 +32,42 @@ from .prep import GitRunner, assert_safe_branch
 from .state_machine import ContributionStore, State
 
 _UNAVAILABLE_MARKERS = ("403", "404", "422")
+
+# GitHub's privacy-preserving no-reply email domain. A `*@users.noreply.github.com`
+# author email is always graph-valid (it maps to the connected account without
+# exposing a real address), so when the user supplied several connected emails we
+# PREFER it for commit authorship over a plain address.
+_NOREPLY_SUFFIX = "@users.noreply.github.com"
+
+
+def select_author_email(user_emails_csv: str | None) -> str:
+    """Pick the commit-author email that decides contribution-graph credit.
+
+    Author email — NOT the committer identity and NOT the OAuth token used to
+    push — is what GitHub counts for the graph (ADR-001 §2[5] line 85: "Commits
+    authored with the user's connected/noreply email"; §6 graph-verify asserts
+    the merge commit's ``author.email`` ∈ the user's connected/noreply set;
+    troubleshooting-missing-contributions). Selection rule: prefer the
+    ``*@users.noreply.github.com`` entry if present (privacy + always graph-valid),
+    else the first configured entry. Source list: the comma/semicolon-separated
+    ``user_emails`` config_meta key. Empty/unset → typed AttributionConfigError
+    so the publish path never silently commits with an unattributed identity."""
+    emails = [
+        e.strip()
+        for e in (user_emails_csv or "").replace(";", ",").split(",")
+        if e.strip()
+    ]
+    if not emails:
+        raise AttributionConfigError(
+            "no commit-author email configured: set the comma-separated "
+            "'user_emails' config_meta key to your connected/noreply GitHub "
+            "email(s). Author email decides contribution-graph credit "
+            "(ADR-001 §2[5]/§6) — committing without it forfeits credit."
+        )
+    for email in emails:
+        if email.lower().endswith(_NOREPLY_SUFFIX):
+            return email
+    return emails[0]
 
 
 def _draft_body(prepared: PreparedContribution, *, upstream_full_name: str) -> str:
@@ -45,6 +86,46 @@ def _draft_body(prepared: PreparedContribution, *, upstream_full_name: str) -> s
     )
 
 
+# Agent-config / auto-load basenames that prep's C-2 strip removes and then
+# restores diff-neutrally (fix_generator._STRIP_EXACT / _STRIP_NESTED_BASENAMES).
+# They must NEVER land in the commit — if `git add -A` stages one, the
+# diff-neutral restore did not happen and we refuse to commit it.
+_CONFIG_DENY_BASENAMES = frozenset({
+    "CLAUDE.md", "CLAUDE.local.md", "AGENTS.md", ".claude", ".mcp.json",
+    ".cursorrules", ".cursor", ".windsurfrules", "copilot-instructions.md",
+})
+
+
+def _assert_no_config_staged(git: GitRunner, *, work_dir: Any) -> None:
+    """Defence-in-depth: verify `git add -A` staged only the substantive fix.
+
+    prep restores the C-2-stripped agent-config files diff-neutrally (via
+    `git checkout`), so they should be working-tree-clean and never staged.
+    We confirm it by listing the staged paths (`git diff --cached --name-only`)
+    and refusing to commit if any deny-listed config basename appears — a stale
+    deletion/modification of one would otherwise be attributed to the user."""
+    staged = git.run(["diff", "--cached", "--name-only"], cwd=work_dir)
+    offenders = [
+        line.strip()
+        for line in staged.splitlines()
+        if line.strip() and line.strip().rsplit("/", 1)[-1] in _CONFIG_DENY_BASENAMES
+    ]
+    if offenders:
+        raise GitOperationError(
+            "refusing to commit: stripped agent-config file(s) are staged "
+            f"({', '.join(offenders)}) — the C-2 diff-neutral restore failed; "
+            "the commit must contain only the substantive fix."
+        )
+
+
+def _commit_message(prepared: PreparedContribution) -> str:
+    """Derive the commit subject from the already-generated PR title. A title
+    is structurally present (build_pr_text); fall back to a generic subject if
+    it is somehow blank so the commit never fails on an empty `-m`."""
+    title = (prepared.pr_text.title or "").strip()
+    return title or f"Fix for {prepared.contribution_id}"
+
+
 def submit_for_approval(
     *,
     db: Database,
@@ -57,11 +138,58 @@ def submit_for_approval(
     fork_full_name: str,
     fork_default_branch: str,
     upstream_full_name: str,
+    commit_author_email: str,
+    commit_author_name: str,
     work_dir: Any,
 ) -> int:
-    """ci-green → draft-on-fork. Returns the fork draft PR number."""
+    """ci-green → draft-on-fork. Returns the fork draft PR number.
+
+    Owns the full "publish to fork" sequence: COMMIT the sandbox-validated fix
+    onto the agent branch → push → open the intra-fork draft PR. The commit step
+    is mandatory and lives here (not in prep) because prep only mutates the
+    working tree and captures `git diff`; without a commit the pushed branch
+    points at the fork default branch and GitHub rejects the PR with 422
+    "No commits between" (the live-smoke failure this wiring fixes)."""
     # M-3: validate-then-pass + `--` end-of-options (see prep.py module head).
     assert_safe_branch(prepared.branch)
+
+    # -- commit the fix (ATTRIBUTION LINCHPIN) --------------------------------
+    # `-A` stages the substantive change only: prep's diff-neutral config strip
+    # already restored tracked config files via `git checkout`, and patch files
+    # live OUTSIDE the clone, so nothing stripped/config is staged. We assert
+    # that below before committing.
+    git.run(["add", "-A"], cwd=work_dir)
+    _assert_no_config_staged(git, work_dir=work_dir)
+    # Per-command `-c user.email=` sets the AUTHOR email on this commit only —
+    # we never touch the host's global git identity. Author email (not the
+    # committer, not the push token) is what GitHub credits to the user's
+    # contribution graph (ADR-001 §2[5] line 85 / §6 graph-verify /
+    # troubleshooting-missing-contributions). Committer defaults to the same
+    # identity via the same `-c` flags.
+    git.run(
+        [
+            "-c", f"user.name={commit_author_name}",
+            "-c", f"user.email={commit_author_email}",
+            "commit", "-m", _commit_message(prepared),
+        ],
+        cwd=work_dir,
+    )
+
+    # -- empty-commit guard (catches a silently-empty agent edit) -------------
+    # A model run that produced no working-tree change leaves HEAD == base_sha;
+    # pushing it would 422 at PR-create. Fail here with a typed, diagnosable
+    # error distinct from auth/PR failures.
+    count_out = git.run(
+        ["rev-list", "--count", f"{prepared.base_sha}..HEAD"], cwd=work_dir
+    ).strip()
+    if not count_out or int(count_out) < 1:
+        raise EmptyCommitError(
+            f"{contribution_id}: branch {prepared.branch!r} has no commits over "
+            f"base {prepared.base_sha[:12]} (rev-list count={count_out or '0'}) — "
+            "the fix produced no change; refusing to push an empty branch "
+            "(would 422 'No commits between' at PR-create)."
+        )
+
     git.run(["push", "origin", "--", prepared.branch], cwd=work_dir)
     pr = gateway.create_draft_pr_on_fork(
         fork_full_name=fork_full_name,

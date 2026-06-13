@@ -36,6 +36,47 @@ from .persistence import Database
 _READ_RETRY_BACKOFF_S = 2.0
 
 
+def _problem_body(exc: Exception) -> str:
+    """Extract GitHub's Problem-Details body from a failed mutation.
+
+    Ground truth (githubkit 0.15.5 installed source, exception.py:39-72,
+    verified 2026-06-12): a non-2xx response is wrapped in ``RequestFailed``
+    whose ``__repr__`` carries ONLY method/url/status — the JSON body
+    (``{"message": ..., "errors": [...]}``) is NOT in str(exc)/repr(exc). For a
+    PR-create 422 that body is the only place the diagnosis lives (e.g.
+    ``errors[].message == "No commits between main and agent/..."``). We reach
+    it via ``exc.response.raw_response.json()`` so the failed-audit + raised
+    error surface the actual cause instead of a bare 422. Best-effort: any
+    shape we can't parse falls back to ``repr(exc)`` (still status-bearing, so
+    the F-11 marker check keeps working)."""
+    response = getattr(exc, "response", None)
+    raw = getattr(response, "raw_response", None)
+    status = getattr(raw, "status_code", None)
+    try:
+        payload = raw.json()  # type: ignore[union-attr]
+    except Exception:
+        return repr(exc)
+    if not isinstance(payload, dict):
+        return repr(exc)
+    parts: list[str] = []
+    if status is not None:
+        parts.append(f"HTTP {status}")
+    message = payload.get("message")
+    if message:
+        parts.append(str(message))
+    errors = payload.get("errors")
+    if isinstance(errors, list):
+        details = [
+            str(e.get("message") or f"{e.get('resource', '')}:{e.get('code', '')}")
+            for e in errors
+            if isinstance(e, dict)
+        ]
+        details = [d for d in details if d and d != ":"]
+        if details:
+            parts.append("; ".join(details))
+    return " — ".join(parts) if parts else repr(exc)
+
+
 @dataclass(frozen=True)
 class PullRef:
     number: int
@@ -107,7 +148,11 @@ class GithubkitClient:
             base_repo_full_name=p.base.repo.full_name,
             head_repo_full_name=p.head.repo.full_name if p.head.repo else "",
             merged=bool(getattr(p, "merged", False)),
-            merge_commit_sha=p.merge_commit_sha,
+            # githubkit's v2026_03_10 PullRequest model omits merge_commit_sha
+            # (verified: model has merged/merged_at but no SHA field). A null
+            # SHA routes graph-verify to its documented commit-message-scan
+            # fallback (ADR §10.4) — the primary path was always UNVERIFIED.
+            merge_commit_sha=getattr(p, "merge_commit_sha", None),
             html_url=p.html_url,
         )
 
@@ -299,14 +344,18 @@ class GitHubGateway:
         try:
             result = call()
         except Exception as exc:
+            # Surface GitHub's Problem-Details body (message + errors[]) so a
+            # PR-create 422 reads "No commits between ..." instead of a bare
+            # 422 — both in the failed-audit record and the raised error.
+            detail = _problem_body(exc)
             with self.db.transaction():
                 self.db.append_audit(
                     actor="agent", phase="failed", endpoint=endpoint,
                     contribution_id=contribution_id,
-                    outcome={"summary": summary, "error": str(exc), **target},
+                    outcome={"summary": summary, "error": detail, **target},
                     rate_state=self.budget.rate_state(),
                 )
-            raise GitHubMutationError(f"{endpoint} failed: {exc}") from exc
+            raise GitHubMutationError(f"{endpoint} failed: {detail}") from exc
         remaining, reset = self.client.rate_headers()
         self.budget.record_rate_headers(remaining, reset)
         object_id = object_id_of(result) if object_id_of is not None else None

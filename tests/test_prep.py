@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,7 @@ from outreach_agent.llm_gateway import FakeLLMClient, LLMGateway
 from outreach_agent.persistence import Database
 from outreach_agent.prep import (
     FakeGitRunner,
+    SystemGitRunner,
     build_pr_text,
     prepare_contribution,
     slugify,
@@ -225,3 +227,158 @@ def test_llm_unavailable_reverts_to_policy_cleared(db: Database,
                        fix_generator=fix_gen))
     assert result.state == State.POLICY_CLEARED
     assert store.get_state(cid) == State.POLICY_CLEARED  # never transitioned away
+
+
+# -- NFR-3: SystemGitRunner token-leak-safe github.com auth --------------------
+#
+# The push must authenticate with the keyring OAuth token via an env-var-fed
+# inline credential helper. These tests assert the token NEVER appears in argv
+# and IS passed via the subprocess env. subprocess.run is patched, so they run
+# in the default lane (no network, no real git). The `x-access-token` username
+# convention itself was verified empirically against a real push (see
+# test_systemgitrunner_real_push_authenticates, marked `local`).
+
+_FAKE_TOKEN = "gho_FAKEtoken0123456789abcdefghijklmnop"
+
+
+class _CapturedRun:
+    """Records the args/env subprocess.run was called with; returns rc=0."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append({"argv": argv, "env": kwargs.get("env")})
+
+        class _Proc:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        return _Proc()
+
+
+def test_systemgitrunner_push_injects_credential_helper_never_token_in_argv(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = _CapturedRun()
+    monkeypatch.setattr("outreach_agent.prep.subprocess.run", captured)
+
+    runner = SystemGitRunner(token_provider=lambda: _FAKE_TOKEN)
+    runner.run(["push", "origin", "--", "agent/12-fix"], cwd=Path("."))
+
+    argv = captured.calls[0]["argv"]
+    env = captured.calls[0]["env"]
+    flat = " ".join(argv)
+    # 1. credential-helper `-c` form is present: empty reset + inline helper.
+    assert "credential.helper=" in flat
+    assert "x-access-token" in flat  # helper SCRIPT (username), not the token
+    assert "$OUTREACH_GIT_TOKEN" in flat  # helper references env by NAME
+    # 2. the literal token is NEVER in argv (process-listing safe).
+    assert all(_FAKE_TOKEN not in part for part in argv)
+    # 3. the token is passed via the SUBPROCESS env only.
+    assert env is not None and env["OUTREACH_GIT_TOKEN"] == _FAKE_TOKEN
+    # 4. the original positional refspec survives after the injected -c flags.
+    assert argv[-2:] == ["--", "agent/12-fix"]
+
+
+def test_systemgitrunner_token_not_persisted_to_parent_env(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """NFR-3: the token lives in the subprocess env ONLY — os.environ (the
+    parent process) is never mutated."""
+    import os
+
+    captured = _CapturedRun()
+    monkeypatch.setattr("outreach_agent.prep.subprocess.run", captured)
+    assert "OUTREACH_GIT_TOKEN" not in os.environ
+    SystemGitRunner(token_provider=lambda: _FAKE_TOKEN).run(
+        ["push", "origin", "--", "agent/12-fix"])
+    assert "OUTREACH_GIT_TOKEN" not in os.environ  # parent env untouched
+
+
+def test_systemgitrunner_non_push_is_not_authenticated(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Lazy + scoped: clone/rev-parse/diff never call the provider and never get
+    the credential-helper flags (public-fork reads are unauthenticated)."""
+    captured = _CapturedRun()
+    monkeypatch.setattr("outreach_agent.prep.subprocess.run", captured)
+    provider_called = False
+
+    def _provider() -> str:
+        nonlocal provider_called
+        provider_called = True
+        return _FAKE_TOKEN
+
+    runner = SystemGitRunner(token_provider=_provider)
+    runner.run(["clone", "--", "https://github.com/x/y.git", "/tmp/y"])
+
+    argv = captured.calls[0]["argv"]
+    assert provider_called is False
+    assert "credential.helper=" not in " ".join(argv)
+    assert captured.calls[0]["env"] is None  # default env inherited
+
+
+def test_systemgitrunner_default_no_provider_is_bare_git(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """FakeGitRunner path / existing behavior: a runner with NO provider runs
+    bare git even on push — no credential flags, no env injection."""
+    captured = _CapturedRun()
+    monkeypatch.setattr("outreach_agent.prep.subprocess.run", captured)
+    SystemGitRunner().run(["push", "origin", "--", "agent/12-fix"])
+    argv = captured.calls[0]["argv"]
+    assert argv == ["git", "push", "origin", "--", "agent/12-fix"]
+    assert captured.calls[0]["env"] is None
+
+
+def test_systemgitrunner_missing_token_on_push_raises_credential_error(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """A push whose provider cannot find the token raises the typed
+    CredentialError (not a traceback) BEFORE git is invoked."""
+    from outreach_agent.errors import CredentialError
+
+    captured = _CapturedRun()
+    monkeypatch.setattr("outreach_agent.prep.subprocess.run", captured)
+
+    def _missing() -> str:
+        raise CredentialError("credential 'github_oauth_token' not found; "
+                              "run `outreach-agent auth login`")
+
+    runner = SystemGitRunner(token_provider=_missing)
+    with pytest.raises(CredentialError):
+        runner.run(["push", "origin", "--", "agent/12-fix"])
+    assert captured.calls == []  # git never ran
+
+
+@pytest.mark.local
+def test_systemgitrunner_real_push_authenticates(tmp_path: Path) -> None:
+    """NFR-3 ground-truth lane (opt-in, `pytest -m local`): proves the
+    `username=x-access-token` + env-fed-token helper authenticates a real
+    `gho_` OAuth token against GitHub. Clones the throwaway smoke-target,
+    pushes an empty-commit branch, asserts success, then deletes the branch.
+    NOT in the default lane (hits the network); requires the keyring token.
+
+    Verified manually 2026-06-12: branch agent/9999-credhelper-verify pushed
+    and deleted on Rutvik552k/outreach-smoke-target; .git/config token-free.
+    """
+    import keyring
+
+    token = keyring.get_password("outreach-agent", "github_oauth_token")
+    if not token:
+        pytest.skip("no keyring github_oauth_token; run `outreach-agent auth login`")
+
+    repo = tmp_path / "smoke"
+    runner = SystemGitRunner(token_provider=lambda: token)
+    # clone is unauthenticated (public); use bare runner semantics via the same
+    # object — clone does not need a token and the runner won't inject one.
+    runner.run(["clone", "--",
+                "https://github.com/Rutvik552k/outreach-smoke-target.git",
+                str(repo)])
+    branch = f"agent/9999-credhelper-{os.getpid()}"
+    runner.run(["checkout", "-b", branch], cwd=repo)
+    runner.run(["commit", "--allow-empty", "-m", "verify: cred-helper (throwaway)"],
+               cwd=repo)
+    try:
+        runner.run(["push", "origin", "--", branch], cwd=repo)  # AUTH path
+        cfg = (repo / ".git" / "config").read_text(encoding="utf-8")
+        assert token not in cfg  # leak-safety: token never lands on disk
+    finally:
+        runner.run(["push", "origin", "--delete", branch], cwd=repo)

@@ -382,13 +382,67 @@ agent made only the minimal edit, flagged malicious CLAUDE.md, no Bash, repo
 Re-review VOID trigger: dropping --safe-mode, adding --mcp-config/--settings/
 --add-dir, or widening --tools.
 
+### ADR-002 implemented + verified (2026-06-12, commit 468b572)
+
+FixGenerator (`src/outreach_agent/fix_generator.py`): B agentic-in-clone for
+claude-code, A context-injection (search/replace, fail-closed on ambiguous
+match) for anthropic. get_issue gateway read feeds real issue title+body.
+git apply removed; capture git diff. Classifier banned-markers now
+position-gated (genuine whitespace/typo bugs no longer dropped). All 8
+security conditions C-1..C-8 with 28 named tests. **851 default-lane tests +
+real agentic path verified** (`pytest -m local` → real Claude Code fix in
+16.85s). Diff-neutral strip = strip-then-`git checkout --` restore of
+tracked config files before diff capture.
+
+### Smoke round 2 attempt 1 — sandbox image gap found + fixed (2026-06-12)
+
+Agentic fix-gen + diff checks PASSED; sandbox returned environment-unfit:
+prod config defaulted `sandbox_image=outreach-agent-sandbox:latest` (never
+built). Live lane used per-stack official tags. FIX: config `sandbox_images`
+per-stack map (python:3.12-slim / node:20-slim / rust:1-slim; react→node) +
+`Config.image_for_stack()`; cmd_prepare resolves image by candidate stack.
+851 tests still green.
+
+### Smoke round 2 attempt 2 — fix-gen + sandbox WORK; push-auth gap (2026-06-12)
+
+**`prepare: ci-green`** — agentic Claude Code produced a GENUINE fix to the
+seeded slugify bug:
+```
+-    return text.strip().lower().replace(" ", "-")
++    return re.sub(r"\s+", "-", text.strip().lower())
+```
+PLUS two regression tests (consecutive-spaces, tab/newline). Passed the real
+two-phase Docker sandbox (pytest). **Core thesis proven: agentic path yields
+real, sandbox-validated quality.** Blocker: `submit_for_approval` push to
+fork failed auth — `SystemGitRunner` uses ambient git creds, not the keyring
+OAuth token. Needs leak-safe token injection (env-fed credential helper).
+
+### Smoke round 2 attempt 3 — push OK; PR 422 (no commit step) (2026-06-12)
+
+Git-auth FIXED + real-push verified (username=x-access-token + token,
+leak-safe, 856 tests). Push now succeeds; PR creation 422. Root cause:
+**no `git commit` anywhere in the pipeline** — fix applied to working tree,
+captured as diff, sandbox-validated, but never committed → pushed branch ==
+fork default → 422 "no commits between". This ALSO means the
+author-email attribution (the whole contribution-graph mechanism, ADR §2[5])
+was unwired. Masked because mocked tests use FakeGitRunner.
+
+### Smoke round 2 attempt 4 — DRAFT PR CREATED on GitHub (2026-06-12)
+
+Commit+attribution wired (863 tests). Re-run: commit ✓, push ✓, **draft PR
+#2 CREATED on Rutvik552k/outreach-smoke-target** (open, draft,
+"[agent:awaiting-approval] Fix slugify...", head agent/1-... → base main).
+Crash AFTER creation: `_pull_ref` read `p.merge_commit_sha` which the
+githubkit v2026_03_10 PullRequest model OMITS (has merged/merged_at, no
+SHA). FIX: `getattr(p, "merge_commit_sha", None)` → graph-verify uses its
+documented commit-message-scan fallback (ADR §10.4 — primary always
+UNVERIFIED). Cleaned up PR#2 + branch; re-running for a clean draft-on-fork.
+
 ## Next actions
 
-1. backend-engineer implements ADR-002 + all 8 conditions — IN FLIGHT:
-   FixGenerator (B agentic claude-code / A context-injection anthropic),
-   get_issue gateway read, real issue body+title in prep, remove git-apply
-   (capture git diff), classifier banned-marker fix, B-timeout 600s, named
-   security tests per signoff.
-2. Re-run smoke round 2 end-to-end after green.
+1. Smoke round 2 attempt 5 (merge_commit_sha fix) — IN FLIGHT. Expect clean
+   draft-on-fork state + draft PR awaiting label.
+2. On draft PR: USER adds `agent:approve-upstream` label → approve-sync
+   opens upstream PR → merge → graph-verify (commit-scan fallback).
 3. USER: delete bootstrap PAT on GitHub; fix billing lock → restore R-1.
 4. Optional hygiene: regenerate OAuth client secret (was pasted in chat).

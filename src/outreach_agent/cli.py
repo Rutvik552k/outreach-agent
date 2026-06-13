@@ -95,6 +95,17 @@ def _resolve_login(db: Database) -> str:
     return login
 
 
+def _user_emails(db: Database) -> set[str]:
+    """The user's connected/noreply emails (config_meta 'user_emails',
+    comma/semicolon-separated, lowercased). Used by graph-verify to assert
+    author-email credit; the raw CSV also feeds commit-author selection."""
+    return {
+        e.strip().lower()
+        for e in (db.get_meta("user_emails") or "").replace(";", ",").split(",")
+        if e.strip()
+    }
+
+
 def cmd_status(db: Database, config: Config) -> int:
     rows = db.conn.execute(
         "SELECT state, COUNT(*) AS n FROM contributions GROUP BY state ORDER BY state"
@@ -180,7 +191,7 @@ def cmd_prepare(db: Database, config: Config) -> int:
     alone left submit_for_approval with no production caller)."""
     from .fix_generator import build_fix_generator
     from .prep import SystemGitRunner, prepare_contribution
-    from .publisher import submit_for_approval
+    from .publisher import select_author_email, submit_for_approval
     from .sandbox import DockerSandboxRunner
 
     row = db.conn.execute(
@@ -211,12 +222,18 @@ def cmd_prepare(db: Database, config: Config) -> int:
                      fields={"fork_full_name": fork_full_name})
 
     llm = _build_llm(db, config)  # NFR-7: backend-aware factory
-    git = SystemGitRunner()
+    # NFR-3: push to the fork needs the keyring OAuth token (clone of the public
+    # fork is unauth). The provider is read LAZILY by SystemGitRunner — only when
+    # a push actually runs — so a missing token surfaces as a typed
+    # CredentialError with remediation (KeyringTokenSource), never a traceback.
+    from .tokens import KeyringTokenSource
+
+    git = SystemGitRunner(token_provider=KeyringTokenSource().github_token)
     # ADR-002 §5: backend-selected fix generator (claude-code → Approach B
     # agentic-in-clone; anthropic → Approach A context-injection).
     fix_generator = build_fix_generator(config, git, llm=llm)
     sandbox = DockerSandboxRunner(
-        image=config.sandbox_image, cpus=config.sandbox_cpus,
+        image=config.image_for_stack(row["stack"]), cpus=config.sandbox_cpus,
         memory=config.sandbox_memory, pids_limit=config.sandbox_pids_limit,
     )
     work_root = Path.home() / ".outreach-agent" / "work"
@@ -241,10 +258,18 @@ def cmd_prepare(db: Database, config: Config) -> int:
     if result.state != State.CI_GREEN or result.prepared is None:
         return 1
 
-    # GAP-3: ci-green → draft-on-fork. submit_for_approval owns the branch
-    # push (publisher.py — prep never pushes, so no double-push) and the
-    # intra-fork draft PR. The draft's base is the FORK's actual default
-    # branch (I-1 follow-up: never assume "main"), resolved via the C5 read.
+    # GAP-3: ci-green → draft-on-fork. submit_for_approval owns the full
+    # publish-to-fork sequence — COMMIT the validated fix, push (prep never
+    # pushes, so no double-push), then open the intra-fork draft PR. The draft's
+    # base is the FORK's actual default branch (I-1 follow-up: never assume
+    # "main"), resolved via the C5 read.
+    #
+    # ATTRIBUTION: the commit's AUTHOR email decides contribution-graph credit
+    # (ADR-001 §2[5]/§6), so resolve it from the user's configured
+    # connected/noreply emails. AttributionConfigError (typed, with remediation)
+    # fires here if 'user_emails' is unset — the publish path never commits with
+    # an unattributed identity.
+    commit_author_email = select_author_email(db.get_meta("user_emails"))
     fork_default_branch = gateway.get_repo_default_branch(login, repo)
     draft_pr_number = submit_for_approval(
         db=db, store=store, gateway=gateway, git=git, config=config,
@@ -253,6 +278,8 @@ def cmd_prepare(db: Database, config: Config) -> int:
         fork_full_name=fork_full_name,
         fork_default_branch=fork_default_branch,
         upstream_full_name=row["repo_full_name"],
+        commit_author_email=commit_author_email,
+        commit_author_name=login,
         work_dir=work_root / contribution_id,
     )
     print(f"draft-on-fork: PR #{draft_pr_number} on {fork_full_name} "
@@ -354,11 +381,7 @@ def cmd_approve_sync(db: Database, config: Config) -> int:
         "SELECT * FROM contributions WHERE state IN ('merged','graph-verify')"
     ).fetchall()
     if gv_rows:
-        user_emails = {
-            e.strip().lower()
-            for e in (db.get_meta("user_emails") or "").replace(";", ",").split(",")
-            if e.strip()
-        }
+        user_emails = _user_emails(db)
         if not user_emails:
             # No verdict without ground truth: matching against a guessed
             # email set would mis-record graph-credited/graph-missing.
