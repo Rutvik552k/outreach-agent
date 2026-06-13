@@ -178,6 +178,21 @@ class LlmCliError(OutreachError):
     source_component = "llm_gateway"
 
 
+class FixApplyError(OutreachError):
+    """Fix-generation produced an unusable result (ADR-002 §5, sign-off C-2/C-4).
+
+    Raised when the Approach-A anchored edit set is malformed or a `search`
+    block does not match exactly once, or when the Approach-B run breaches
+    cwd-confinement (an edit/escape outside the clone) or finds host secrets in
+    the cwd. Non-retriable: re-running the same blind input reproduces it, so
+    prep maps it to the re-enterable ERROR state (no partial `prepared`),
+    matching the old `git apply` failure mapping (prep.py FM9 handlers)."""
+
+    type_uri = "urn:outreach-agent:error:fix-apply"
+    title = "Fix generation produced an unusable or unsafe result (ADR-002)"
+    source_component = "fix_generator"
+
+
 class GitOperationError(OutreachError):
     type_uri = "urn:outreach-agent:error:git-operation"
     title = "Local git operation failed"

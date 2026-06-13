@@ -67,6 +67,37 @@ def test_mutation_failure_audits_failed(gateway: GitHubGateway,
         ["intent", "failed"]
 
 
+def test_get_issue_is_a_read_no_budget_no_audit(gateway: GitHubGateway,
+                                                fake_client: FakeGitHubClient,
+                                                db: Database) -> None:
+    """ADR-002 §4 (C5): get_issue is a READ — it returns the title + body, does
+    NOT consume budget, and writes NO audit row (reads route through _read, not
+    _mutate)."""
+    fake_client.issues["acme/some-lib#12"] = {
+        "title": "Crash on empty input",
+        "body": "parse('') raises IndexError",
+    }
+    audit_before = db.conn.execute(
+        "SELECT COUNT(*) AS n FROM audit_log").fetchone()["n"]
+    issue = gateway.get_issue("acme", "some-lib", 12)
+    assert issue == {"number": 12, "title": "Crash on empty input",
+                     "body": "parse('') raises IndexError"}
+    # no audit row was appended (reads are not budgeted/audited mutations)
+    audit_after = db.conn.execute(
+        "SELECT COUNT(*) AS n FROM audit_log").fetchone()["n"]
+    assert audit_after == audit_before
+    assert any(c[0] == "get_issue" for c in fake_client.calls)
+
+
+def test_get_issue_missing_body_normalized_to_empty(
+        gateway: GitHubGateway, fake_client: FakeGitHubClient) -> None:
+    """ADR-002 §4: a Missing/None issue body is normalised to "" so generation
+    proceeds on the title alone (degraded, not blocked)."""
+    fake_client.issues["acme/some-lib#7"] = {"title": "Title only"}
+    issue = gateway.get_issue("acme", "some-lib", 7)
+    assert issue["title"] == "Title only" and issue["body"] == ""
+
+
 def test_budget_denial_blocks_call_before_intent(gateway: GitHubGateway,
                                                  fake_client: FakeGitHubClient,
                                                  db: Database) -> None:

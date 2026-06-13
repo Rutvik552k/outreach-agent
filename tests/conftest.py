@@ -70,6 +70,9 @@ class FakeGitHubClient:
         self.search_results: list[dict[str, Any]] = []
         self.repo_files: dict[str, str] = {}  # "owner/repo/path" -> content
         self.default_branches: dict[str, str] = {}  # "owner/repo" -> branch ("main" if unset)
+        # ADR-002 §4: configurable issue bodies, keyed "owner/repo#number".
+        # Unset → a default title/body so existing tests need no wiring.
+        self.issues: dict[str, dict[str, Any]] = {}
         self.review_comments: list[dict[str, Any]] = []
         self.pr_reviews: list[dict[str, Any]] = []
         self.own_repos: list[dict[str, Any]] = []
@@ -148,6 +151,17 @@ class FakeGitHubClient:
     def get_repo_default_branch(self, owner, repo):
         self._record("get_repo_default_branch", owner, repo)
         return self.default_branches.get(f"{owner}/{repo}", "main")
+
+    def get_issue(self, owner, repo, issue_number):
+        self._record("get_issue", owner, repo, issue_number)
+        key = f"{owner}/{repo}#{issue_number}"
+        issue = self.issues.get(key)
+        if issue is None:
+            return {"number": issue_number,
+                    "title": f"Issue {issue_number}", "body": ""}
+        return {"number": issue_number,
+                "title": issue.get("title", f"Issue {issue_number}"),
+                "body": issue.get("body", "")}
 
     def rate_headers(self):
         return (4999, 1760000000)

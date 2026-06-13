@@ -12,6 +12,7 @@ such; merge-rate KPI (§8) is the corrective feedback loop.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -29,7 +30,36 @@ _STACK_QUERY: dict[str, str] = {
     "react": "language:typescript react",
 }
 
+# ADR-002 §6 (classifier false-positive fix): the banned-marker mechanism
+# drops low-value contribution SPAM (typo/whitespace-only/image-opt PRs — ADR
+# §2 Policy Pre-flight). The old rule matched a marker ANYWHERE in the title,
+# which nuked genuine bugs whose subject merely contains the word (live smoke:
+# "Bug: slugify produces repeated hyphens for consecutive whitespace" was
+# wrongly dropped). The fix narrows the signal from "marker appears anywhere"
+# to "the marker denotes the CHANGE TYPE" — i.e. it is the leading token of
+# the title (optionally after a "fix"/"fixing" verb), as in spam titles like
+# "Typo in README", "Whitespace fix in utils.py", "Image optimization". A
+# marker that is the *subject* of a descriptive bug title ("… for consecutive
+# whitespace") is no longer matched, because it is not in change-type position.
 _BANNED_TITLE_MARKERS = ("typo", "whitespace", "image optimization", "image-optimization")
+
+# Change-type position: the marker is the first meaningful phrase of the title,
+# optionally preceded by a "fix"/"fixing"/"fixes" verb and followed by a
+# word-boundary (so "whitespace" matches "Whitespace: …" / "whitespace fix in …"
+# / "fix whitespace in …" but NOT "… consecutive whitespace"). Anchored at the
+# title start only — change-type lives in the leading position.
+_BANNED_MARKER_RE = re.compile(
+    r"^\s*(?:fix(?:es|ing)?\s+)?(?:"
+    + "|".join(re.escape(m) for m in _BANNED_TITLE_MARKERS)
+    + r")\b"
+)
+
+
+def _is_banned_change_type(title: str) -> bool:
+    """ADR-002 §6: True only when a banned marker is in CHANGE-TYPE position
+    (leading token, optionally after a fix-verb) — not when it is merely the
+    subject of a genuine bug title."""
+    return bool(_BANNED_MARKER_RE.match(title.lower()))
 
 
 def _parse_allowlist(entries: tuple[str, ...]) -> list[tuple[str, Stack]]:
@@ -67,7 +97,7 @@ def classify(item: dict[str, Any]) -> ContributionType | None:
     """Map an issue to an allowed contribution type (C1 — banned types are
     unrepresentable). Banned-marker titles return None and are dropped."""
     title = (item.get("title") or "").lower()
-    if any(marker in title for marker in _BANNED_TITLE_MARKERS):
+    if _is_banned_change_type(title):
         return None
     labels = {(l.get("name") or "").lower() for l in item.get("labels") or []}
     text = title + " " + " ".join(labels)

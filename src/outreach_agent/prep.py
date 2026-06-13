@@ -21,10 +21,12 @@ from .contracts import PreparedContribution, PrText
 from .diff_checks import run_diff_checks
 from .errors import (
     DiffInvariantError,
+    FixApplyError,
     GitOperationError,
     LlmBudgetError,
     LlmUnavailableError,
 )
+from .fix_generator import FixGenerator
 from .llm_gateway import LLMGateway
 from .persistence import Database, canonical_json
 from .sandbox import SandboxRunner, SandboxSpec, Verdict
@@ -174,14 +176,6 @@ def build_pr_text(*, title: str, description_md: str, issue_url: str,
     return PrText(title=title, body_md=body, linked_issue=issue_url)
 
 
-_PATCH_SYSTEM = (
-    "You are preparing a minimal, convention-following fix for an open-source "
-    "issue. Output ONLY a unified diff (git apply compatible) that fixes the "
-    "issue and adds or extends a test demonstrating the fix. No prose, no "
-    "code fences. Never touch .github/workflows/ paths or lockfiles unless "
-    "the issue explicitly requires it."
-)
-
 _PR_TEXT_SYSTEM = (
     "Draft a concise pull-request title and description for the provided "
     "diff and issue, following common open-source conventions. First line: "
@@ -202,6 +196,7 @@ def prepare_contribution(
     db: Database,
     store: ContributionStore,
     llm: LLMGateway,
+    fix_generator: FixGenerator,
     sandbox: SandboxRunner,
     git: GitRunner,
     config: Config,
@@ -237,29 +232,34 @@ def prepare_contribution(
         # parsing), and assert_safe_branch above pins its shape.
         git.run(["checkout", "-b", branch], cwd=work_dir)
 
-        patch = llm.generate(
-            purpose="fix-generation",
-            system=_PATCH_SYSTEM,
-            prompt=(
-                f"Repository issue #{issue_number}: {issue_title}\n\n"
-                f"{issue_body}\n\nProduce the unified diff now."
-            ),
+        # ADR-002 §5: the FixGenerator MUTATES files in work_dir (Approach B
+        # edits agentically in the clone; Approach A applies an anchored edit
+        # set). prep then captures the change with `git diff`. The fragile
+        # `git apply` round-trip — the [SMOKE] "No valid patches" failure site —
+        # is removed entirely. Downstream (diff checks, workflow-skip, C8
+        # sandbox, C3 construction) is unchanged.
+        fix_generator.generate_fix(
+            work_dir=work_dir, branch=branch,
+            issue_title=issue_title, issue_body=issue_body, stack=stack,
         )
-        # Patch lives OUTSIDE the clone so it can never appear in the diff.
-        patch_file = work_root / f"{contribution_id}.patch"
-        patch_file.write_text(patch, encoding="utf-8", newline="\n")
-        git.run(["apply", "--check", str(patch_file)], cwd=work_dir)
-        git.run(["apply", str(patch_file)], cwd=work_dir)
-        patch_file.unlink(missing_ok=True)
         diff_text = git.run(["diff"], cwd=work_dir)
     except (LlmBudgetError,) as exc:
         _cleanup()
         store.transition(contribution_id, State.LLM_BLOCKED, reason=str(exc))
         return PrepResult(State.LLM_BLOCKED, None, str(exc))
     except (LlmUnavailableError,) as exc:
-        # FM9: revert to re-enterable policy-cleared; no partial `prepared`.
+        # FM9 / C-8: timeout or transient backend failure → revert to
+        # re-enterable policy-cleared; _cleanup() discards the work_dir so no
+        # partial in-place edit survives (the B run edits in place).
         _cleanup()
         return PrepResult(State.POLICY_CLEARED, None, f"LLM unavailable, reverted: {exc}")
+    except FixApplyError as exc:
+        # Anchored-edit mismatch (Approach A) or cwd-confinement / no-secrets
+        # breach (Approach B, C-4/C-6): non-retriable → re-enterable ERROR,
+        # matching the old git-apply-failure mapping. No partial `prepared`.
+        _cleanup()
+        store.transition(contribution_id, State.ERROR, reason=str(exc))
+        return PrepResult(State.ERROR, None, str(exc))
     except GitOperationError as exc:
         _cleanup()
         store.transition(contribution_id, State.ERROR, reason=str(exc))

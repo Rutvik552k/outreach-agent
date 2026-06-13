@@ -320,12 +320,75 @@ clock, network-none proof). Default lane: **791 passed, 1 skipped**.
   issue" — GitHub Actions won't start any job. User must resolve at
   github.com/settings/billing, then re-run. Not a code failure.
 
+### Live-smoke round 1 + gap fixes — DONE (2026-06-12, commit 068f502)
+
+- I-1 FIXED: default branch resolved via new gateway read (per-run cache).
+- Live smoke crash FIXED: gateway reads retry-once-on-timeout + typed
+  retriable GitHubReadError; discover continues per-candidate, no TTL
+  cache poisoning.
+- auth-login now stores github_login (was never persisted; live DB
+  bootstrapped manually first, overwritten cleanly on next login).
+- Pipeline gaps WIRED: prepare → submit_for_approval (draft-on-fork, fork
+  default branch); graph-verify execution in approve-sync (upstream
+  default branch, user_emails from config_meta — fetched + stored).
+- **AC-1 LIVE PASS**: 178 candidates / 173 policy-cleared from real GitHub
+  search across 4 stacks; per-candidate block-and-continue proven live.
+- 820 tests green.
+- **Branch protection REMOVED per explicit user decision** (CI billing
+  lock made required checks unsatisfiable; user chose full removal over
+  temporary lift). **RESTORE R-1 PROTECTION when billing fixed**: both CI
+  jobs required, strict, enforce_admins, no force-push.
+
+### Live-smoke round 2 — BLOCKER FOUND (2026-06-12)
+
+Seeded `Rutvik552k/outreach-smoke-target` issue #1 (real slugify bug).
+Discovery/policy/fork/clone ✓; **`prepare` FAILED at fix-generation**:
+Claude Code returned prose, not an appliable unified diff → `git apply`:
+"No valid patches in input". Root cause: LLM is blind (no repo files, only
+issue URL as body) and asked for a byte-exact diff; Claude Code's agentic
+strength disabled by `--tools ""`/neutral cwd. Full grounded finding:
+`docs/findings/smoke-fixgen-blocker.md`. Also found: classifier
+banned-marker `whitespace` dropped a genuine bug (false positive).
+
+### ADR-002 fix-generation — DECIDED (2026-06-12, `docs/adr/ADR-002-fix-generation.md`)
+
+Hybrid: **B agentic-in-clone for claude-code** (Claude Code edits files in
+the clone with Read/Edit/Write; Bash/WebFetch/WebSearch disallowed;
+--permission-mode acceptEdits, --safe-mode, --setting-sources user; pre-strip
+CLAUDE.md/.claude/AGENTS.md), **A context-injection for anthropic**. Prep
+captures `git diff` after in-place edit; `git apply` removed (the smoke
+failure site). Key correction: Claude Code has NO --network flag (must reach
+hosted model) → "network off" = no exec/fetch tools only; all repo-code exec
+still C8-contained. Also: issue-body re-fetch via gateway get_issue (fixes
+blind LLM + fabricated title); classifier banned-marker scope fix; B-path
+timeout → 600s. LLMClient protocol unchanged; new FixGenerator; C3 unchanged.
+
+### ADR-002 security gate — SIGN-OFF-WITH-CONDITIONS (2026-06-12, `docs/security/adr-002-signoff.md`)
+
+8 conditions (3 BLOCKERS), each with a named test. Verified by live probing
+of local Claude Code 2.1.176. **Key finding: `--safe-mode` is the real
+containment linchpin, NOT `--setting-sources user`** — without safe-mode,
+user-level MCP servers (Gmail/Drive/Calendar, connected on this host) + LSP
+leak into the agentic session despite the `--tools` allowlist. PROBE-1:
+agent made only the minimal edit, flagged malicious CLAUDE.md, no Bash, repo
+.mcp.json never spawned. AC2 preserved (zero repo-code exec at gen time).
+- C-1 BLOCKER: `--safe-mode` mandatory/non-removable; correct ADR-002 text.
+- C-2 BLOCKER: complete DIFF-NEUTRAL pre-strip (add .mcp.json, .cursor/,
+  .windsurfrules, nested **/CLAUDE.md, copilot-instructions; strip must NOT
+  appear in captured git diff).
+- C-3 BLOCKER: no-exec-tools argv lint (Bash/WebFetch/WebSearch never in argv).
+- C-4 structural cwd-confinement; C-5 R-B2 risk-note surfacing; C-6 no host
+  secrets in cwd; C-7 retain hardening flags; C-8 timeout→re-enterable+discard.
+Re-review VOID trigger: dropping --safe-mode, adding --mcp-config/--settings/
+--add-dir, or widening --tools.
+
 ## Next actions
 
-1. USER: delete bootstrap PAT on GitHub (broad scopes); fix billing lock;
-   re-run CI (expect both jobs green = H-2 enforcement live).
-2. Live-smoke lane (AC-1/4/5): real discovery run, one end-to-end PR to a
-   user-owned repo, graph-credit verification. I-1 fix
-   (upstream_base_branch hardcode) before first real upstream PR.
-3. Optional hygiene: regenerate OAuth client secret (was pasted in chat),
-   re-store via keyring.
+1. backend-engineer implements ADR-002 + all 8 conditions — IN FLIGHT:
+   FixGenerator (B agentic claude-code / A context-injection anthropic),
+   get_issue gateway read, real issue body+title in prep, remove git-apply
+   (capture git diff), classifier banned-marker fix, B-timeout 600s, named
+   security tests per signoff.
+2. Re-run smoke round 2 end-to-end after green.
+3. USER: delete bootstrap PAT on GitHub; fix billing lock → restore R-1.
+4. Optional hygiene: regenerate OAuth client secret (was pasted in chat).

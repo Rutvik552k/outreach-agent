@@ -260,6 +260,13 @@ EXPECTED_READS = {
     #   never assumes "main"; GET /repos/{owner}/{repo} → default_branch
     #   (githubkit 0.15.5 rest/repos.py:1529, models/group_0187.py:93).
     "get_repo_default_branch",
+    # ADR-002 §4 deliberate addition, re-reviewed against C4 v2.1 — READ ONLY,
+    # no label or approval capability added:
+    # - get_issue: re-fetch the real issue title + body for fix-generation so
+    #   the LLM is not blind (the candidates schema stores only the URL);
+    #   GET /repos/{owner}/{repo}/issues/{issue_number} → Issue.title/body
+    #   (githubkit 0.15.5 rest/issues.py:1682, models/group_0057.py:54/55).
+    "get_issue",
 }
 
 

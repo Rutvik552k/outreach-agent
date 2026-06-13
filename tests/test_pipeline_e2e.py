@@ -13,6 +13,7 @@ from conftest import FORK, FORK_OWNER, UPSTREAM, FakeGitHubClient, make_pull_ref
 from outreach_agent.config import Config
 from outreach_agent.discovery import discover
 from outreach_agent.github_gateway import GitHubGateway
+from outreach_agent.fix_generator import FakeFixGenerator
 from outreach_agent.llm_gateway import FakeLLMClient, LLMGateway
 from outreach_agent.persistence import Database
 from outreach_agent.policy import preflight, recheck_policy
@@ -70,13 +71,15 @@ def test_full_pipeline_discovered_to_upstream_open(
     store.transition(cid, State.POLICY_CLEARED, reason="pre-flight cleared",
                      fields={"fork_full_name": FORK})
 
-    # -- [3] prep: LLM patch + sandbox validation (C8 fake) ----------------------
-    llm_client = FakeLLMClient([GOOD_DIFF, "Fix empty-input crash\nHandles ''."])
+    # -- [3] prep: fix-generation (FixGenerator seam) + sandbox validation (C8
+    # fake) — ADR-002: fix-gen mutates the clone; prep captures `git diff`.
+    llm_client = FakeLLMClient(["Fix empty-input crash\nHandles ''."])
     llm = LLMGateway(llm_client, db, config)
     sandbox = FakeSandboxRunner()
     git = FakeGitRunner({"rev-parse": "abc123\n", "diff": GOOD_DIFF})
     prep_result = prepare_contribution(
-        db=db, store=store, llm=llm, sandbox=sandbox, git=git, config=config,
+        db=db, store=store, llm=llm, fix_generator=FakeFixGenerator(),
+        sandbox=sandbox, git=git, config=config,
         contribution_id=cid,
         fork_clone_url=f"https://github.com/{FORK}.git",
         issue_title="Crash when parsing empty input",
@@ -154,10 +157,12 @@ def test_full_pipeline_discovered_to_upstream_open(
     assert gate_row["actor"] == "user"
     assert "4242" in gate_row["outcome_json"]
 
-    # LLM spend recorded for both calls (fix-generation + pr-text)
+    # LLM spend: under ADR-002 fix-generation no longer routes a text
+    # completion through the gateway (the FixGenerator mutates the clone and
+    # prep captures `git diff`), so only the pr-text call is ledgered here.
     spend = db.conn.execute(
         "SELECT COUNT(*) AS n, SUM(cost_usd) AS total FROM llm_spend").fetchone()
-    assert spend["n"] == 2 and spend["total"] > 0
+    assert spend["n"] == 1 and spend["total"] > 0
 
     # daily budget: a second upstream PR today is denied (AC-6)
     from outreach_agent.budget import BudgetTracker

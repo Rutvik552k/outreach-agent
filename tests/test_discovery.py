@@ -40,10 +40,28 @@ def test_allowlist_queries_come_first(config: Config) -> None:
 
 
 def test_banned_type_titles_are_dropped() -> None:
-    """FR-1 banned types: typo/whitespace/image-optimization unrepresentable."""
+    """FR-1 banned types: typo/whitespace/image-optimization unrepresentable.
+    These are change-type-in-position SPAM titles (leading marker, optionally
+    after a fix-verb) — still dropped after the ADR-002 §6 narrowing."""
     assert classify(_issue(title="Fix typo in README")) is None
     assert classify(_issue(title="Whitespace cleanup")) is None
     assert classify(_issue(title="Image optimization pass")) is None
+    # leading-marker spam variants also dropped
+    assert classify(_issue(title="Typo: missing comma")) is None
+    assert classify(_issue(title="Whitespace fix in utils.py")) is None
+
+
+def test_genuine_bug_with_marker_as_subject_not_dropped() -> None:
+    """ADR-002 §6 regression: the live false-positive — a genuine bug whose
+    title merely CONTAINS "whitespace" as its subject (not in change-type
+    position) must NOT be dropped. Old rule (substring-anywhere) nuked it."""
+    title = "Bug: slugify produces repeated hyphens for consecutive whitespace"
+    assert classify(_issue(title=title)) == "bugfix-static-analysis"
+    # further genuine-bug-with-marker-subject cases stay classified, not dropped
+    assert classify(_issue(title="Crash on trailing whitespace in parser")) \
+        == "bugfix-static-analysis"
+    assert classify(_issue(title="Error: typo detection misfires on unicode")) \
+        == "bugfix-static-analysis"
 
 
 def test_classification_maps_to_allowed_types_only() -> None:

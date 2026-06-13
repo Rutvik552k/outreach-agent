@@ -178,6 +178,7 @@ def cmd_prepare(db: Database, config: Config) -> int:
     """Prepare the highest-scored cleared candidate (C8 sandbox mandatory),
     then submit it for approval: end state is draft-on-fork (GAP-3 — ci-green
     alone left submit_for_approval with no production caller)."""
+    from .fix_generator import build_fix_generator
     from .prep import SystemGitRunner, prepare_contribution
     from .publisher import submit_for_approval
     from .sandbox import DockerSandboxRunner
@@ -210,19 +211,27 @@ def cmd_prepare(db: Database, config: Config) -> int:
                      fields={"fork_full_name": fork_full_name})
 
     llm = _build_llm(db, config)  # NFR-7: backend-aware factory
+    git = SystemGitRunner()
+    # ADR-002 §5: backend-selected fix generator (claude-code → Approach B
+    # agentic-in-clone; anthropic → Approach A context-injection).
+    fix_generator = build_fix_generator(config, git, llm=llm)
     sandbox = DockerSandboxRunner(
         image=config.sandbox_image, cpus=config.sandbox_cpus,
         memory=config.sandbox_memory, pids_limit=config.sandbox_pids_limit,
     )
-    git = SystemGitRunner()
     work_root = Path.home() / ".outreach-agent" / "work"
+    # ADR-002 §4: re-fetch the REAL issue title + body via the C5 gateway read
+    # so fix generation is not blind (the candidates schema stores only the
+    # URL). A Missing/None body is normalised to "" by the gateway.
+    upstream_owner, upstream_repo = row["repo_full_name"].split("/", 1)
+    issue = gateway.get_issue(upstream_owner, upstream_repo, row["issue_number"])
     result = prepare_contribution(
         db=db, store=store,
-        llm=llm, sandbox=sandbox, git=git, config=config,
+        llm=llm, fix_generator=fix_generator, sandbox=sandbox, git=git, config=config,
         contribution_id=contribution_id,
         fork_clone_url=f"https://github.com/{fork_full_name}.git",
-        issue_title=f"issue #{row['issue_number']}",
-        issue_body=row["issue_url"],
+        issue_title=issue["title"],
+        issue_body=issue["body"],
         issue_number=row["issue_number"],
         issue_url=row["issue_url"],
         stack=row["stack"],

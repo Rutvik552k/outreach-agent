@@ -6,6 +6,7 @@ import pytest
 
 from outreach_agent.config import Config
 from outreach_agent.errors import LlmBudgetError, LlmUnavailableError
+from outreach_agent.fix_generator import FakeFixGenerator
 from outreach_agent.llm_gateway import FakeLLMClient, LLMGateway
 from outreach_agent.persistence import Database
 from outreach_agent.prep import (
@@ -51,9 +52,12 @@ def _make_contribution(store: ContributionStore) -> str:
 def _prep_kwargs(db: Database, store: ContributionStore, config: Config,
                  tmp_path: Path, *, llm: LLMGateway,
                  sandbox: FakeSandboxRunner, git: FakeGitRunner,
-                 cid: str) -> dict:
+                 cid: str,
+                 fix_generator: FakeFixGenerator | None = None) -> dict:
     return dict(
-        db=db, store=store, llm=llm, sandbox=sandbox, git=git, config=config,
+        db=db, store=store, llm=llm,
+        fix_generator=fix_generator or FakeFixGenerator(),
+        sandbox=sandbox, git=git, config=config,
         contribution_id=cid,
         fork_clone_url="https://github.com/rutvik/some-lib.git",
         issue_title="Crash when parsing empty input",
@@ -183,16 +187,22 @@ def test_llm_spend_cap_mid_prep_is_llm_blocked(db: Database,
                                                store: ContributionStore,
                                                config: Config,
                                                tmp_path: Path) -> None:
-    """FM9/F-13: spend cap → llm-blocked, no partial prepared."""
+    """FM9/F-13: spend cap → llm-blocked, no partial prepared. The budget hard
+    stop fires at the fix-generation seam (Approach A routes its LLM call
+    through the gateway); the FixGenerator surfaces LlmBudgetError, which prep
+    maps to llm-blocked."""
     import dataclasses
 
     cid = _make_contribution(store)
     tight = dataclasses.replace(config, llm_monthly_spend_cap_usd=0.0)
     llm = LLMGateway(FakeLLMClient([GOOD_DIFF]), db, tight)
+    fix_gen = FakeFixGenerator()
+    fix_gen.fail_next = LlmBudgetError("monthly LLM spend cap reached (F-13)")
     result = prepare_contribution(
         **_prep_kwargs(db, store, tight, tmp_path, llm=llm,
                        sandbox=FakeSandboxRunner(),
-                       git=FakeGitRunner({"rev-parse": "abc\n"}), cid=cid))
+                       git=FakeGitRunner({"rev-parse": "abc\n"}), cid=cid,
+                       fix_generator=fix_gen))
     assert result.state == State.LLM_BLOCKED
     assert store.get_state(cid) == State.LLM_BLOCKED
     assert result.prepared is None
@@ -202,14 +212,16 @@ def test_llm_unavailable_reverts_to_policy_cleared(db: Database,
                                                    store: ContributionStore,
                                                    config: Config,
                                                    tmp_path: Path) -> None:
-    """FM9: outage mid-prep reverts to re-enterable policy-cleared."""
+    """FM9/C-8: outage or timeout at fix-generation reverts to re-enterable
+    policy-cleared; the work_dir is discarded (no partial prepared)."""
     cid = _make_contribution(store)
-    client = FakeLLMClient()
-    client.fail_next = LlmUnavailableError("503 after retries")
-    llm = LLMGateway(client, db, config)
+    llm = LLMGateway(FakeLLMClient(), db, config)
+    fix_gen = FakeFixGenerator()
+    fix_gen.fail_next = LlmUnavailableError("claude CLI timed out (retriable)")
     result = prepare_contribution(
         **_prep_kwargs(db, store, config, tmp_path, llm=llm,
                        sandbox=FakeSandboxRunner(),
-                       git=FakeGitRunner({"rev-parse": "abc\n"}), cid=cid))
+                       git=FakeGitRunner({"rev-parse": "abc\n"}), cid=cid,
+                       fix_generator=fix_gen))
     assert result.state == State.POLICY_CLEARED
     assert store.get_state(cid) == State.POLICY_CLEARED  # never transitioned away

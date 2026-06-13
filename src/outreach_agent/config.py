@@ -43,7 +43,13 @@ class Config:
     # claude-code backend is subscription-backed and records 0-cost entries.
     llm_backend: str = "claude-code"  # ∈ {"claude-code", "anthropic"}
     claude_cli_executable: str = "claude"
-    claude_cli_timeout_s: int = 300
+    # ADR-002 §7 / sign-off C-8: the agentic Approach-B fix-generation run is a
+    # multi-step operation (the model reads files, plans, edits) and needs a
+    # larger wall clock than a single text completion. 600 s stays inside the
+    # SystemGitRunner 600 s git timeout and the C8 sandbox 900 s wall clock.
+    # Kept DISTINCT from llm_timeout_s (120 s, the anthropic single-call
+    # timeout) — the two are different operations (ADR-002 §7).
+    claude_cli_timeout_s: int = 600
     # §5 self-imposed caps (~10% of platform secondary limits)
     content_creation_per_min: int = 8
     content_creation_per_hr: int = 50

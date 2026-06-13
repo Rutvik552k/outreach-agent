@@ -76,6 +76,8 @@ class GitHubClient(Protocol):
     def search_issues(self, query: str) -> list[dict[str, Any]]: ...
     def get_repo_file(self, owner: str, repo: str, path: str) -> str | None: ...
     def get_repo_default_branch(self, owner: str, repo: str) -> str: ...
+    def get_issue(self, owner: str, repo: str,
+                  issue_number: int) -> dict[str, Any]: ...
     def rate_headers(self) -> tuple[int | None, int | None]: ...
 
 
@@ -220,6 +222,25 @@ class GithubkitClient:
         models/group_0187.py:93 (`default_branch: str = Field()`)."""
         resp = self._capture(self._gh.rest.repos.get(owner, repo))
         return resp.parsed_data.default_branch
+
+    def get_issue(self, owner: str, repo: str,
+                  issue_number: int) -> dict[str, Any]:
+        """GET /repos/{owner}/{repo}/issues/{issue_number} → the issue title +
+        raw-markdown body for fix generation (ADR-002 §4). Ground source:
+        githubkit 0.15.5 installed source — rest/issues.py:1682 (`issues.get`
+        → Response[Issue]; the default media type "Returns the raw markdown
+        body. Response will include `body`", issues.py:1707), and the Issue
+        model fields models/group_0057.py:47/54/55 (`number: int`,
+        `title: str`, `body: Missing[Union[str, None]]`). A Missing/None body
+        is normalised to "" so generation proceeds on the title alone."""
+        resp = self._capture(self._gh.rest.issues.get(owner, repo, issue_number))
+        data = resp.parsed_data
+        body = getattr(data, "body", None)
+        return {
+            "number": data.number,
+            "title": data.title,
+            "body": body if isinstance(body, str) else "",
+        }
 
     def rate_headers(self) -> tuple[int | None, int | None]:
         rem = self._last_headers.get("x-ratelimit-remaining")
@@ -390,6 +411,17 @@ class GitHubGateway:
         return self._read(
             f"get default branch {owner}/{repo}",
             lambda: self.client.get_repo_default_branch(owner, repo))
+
+    def get_issue(self, owner: str, repo: str,
+                  issue_number: int) -> dict[str, Any]:
+        """ADR-002 §4: re-fetch the issue title + body at prepare time so
+        fix-generation is not blind (the candidates schema stores only the URL).
+        READ only — routes through `_read`, no budget/audit (reads are not
+        budgeted mutations, matching the other gateway reads). Re-reviewed
+        against C4 v2.1: a READ with no label or approval capability."""
+        return self._read(
+            f"get issue {owner}/{repo}#{issue_number}",
+            lambda: self.client.get_issue(owner, repo, issue_number))
 
     # -- idempotency read-check (FM1: never retry a mutation blind) -----------
 
