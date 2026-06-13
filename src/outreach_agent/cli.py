@@ -136,28 +136,50 @@ def cmd_resume(db: Database) -> int:
 
 def cmd_discover(db: Database, config: Config) -> int:
     from .discovery import discover
+    from .errors import GitHubReadError
     from .policy import preflight
 
     gateway = _build_gateway(db, config)
     candidates = discover(gateway, db, config)
     cleared = 0
     for candidate in candidates:
-        verdict = preflight(
-            gateway, db, config,
-            repo_full_name=candidate.repo_full_name,
-            candidate_id=candidate.candidate_id,
-        )
-        if verdict.verdict == "cleared":
+        # GAP-1(b): a transient read failure (e.g. one slow CONTRIBUTING.md
+        # fetch) blocks THIS candidate for THIS run only and the loop
+        # continues. It is deliberately NOT persisted to policy_verdicts —
+        # preflight raises before its _persist step, so the 7-day TTL cache
+        # is never poisoned by a retriable transport error.
+        try:
+            verdict_value = preflight(
+                gateway, db, config,
+                repo_full_name=candidate.repo_full_name,
+                candidate_id=candidate.candidate_id,
+            ).verdict
+            suffix = ""
+        except GitHubReadError as exc:
+            verdict_value = "blocked"
+            suffix = " — preflight-read-failed (retriable)"
+            with db.transaction():
+                db.append_audit(
+                    actor="agent", phase="info",
+                    endpoint="policy:preflight-read-failed",
+                    outcome={"candidate_id": candidate.candidate_id,
+                             "repo": candidate.repo_full_name,
+                             "error": str(exc), "retriable": True},
+                )
+        if verdict_value == "cleared":
             cleared += 1
-        print(f"  [{verdict.verdict:7}] {candidate.repo_full_name}"
-              f"#{candidate.issue_number} score={candidate.score.total}")
+        print(f"  [{verdict_value:7}] {candidate.repo_full_name}"
+              f"#{candidate.issue_number} score={candidate.score.total}{suffix}")
     print(f"{len(candidates)} candidates, {cleared} policy-cleared")
     return 0
 
 
 def cmd_prepare(db: Database, config: Config) -> int:
-    """Prepare the highest-scored cleared candidate (C8 sandbox mandatory)."""
+    """Prepare the highest-scored cleared candidate (C8 sandbox mandatory),
+    then submit it for approval: end state is draft-on-fork (GAP-3 — ci-green
+    alone left submit_for_approval with no production caller)."""
     from .prep import SystemGitRunner, prepare_contribution
+    from .publisher import submit_for_approval
     from .sandbox import DockerSandboxRunner
 
     row = db.conn.execute(
@@ -192,9 +214,11 @@ def cmd_prepare(db: Database, config: Config) -> int:
         image=config.sandbox_image, cpus=config.sandbox_cpus,
         memory=config.sandbox_memory, pids_limit=config.sandbox_pids_limit,
     )
+    git = SystemGitRunner()
+    work_root = Path.home() / ".outreach-agent" / "work"
     result = prepare_contribution(
         db=db, store=store,
-        llm=llm, sandbox=sandbox, git=SystemGitRunner(), config=config,
+        llm=llm, sandbox=sandbox, git=git, config=config,
         contribution_id=contribution_id,
         fork_clone_url=f"https://github.com/{fork_full_name}.git",
         issue_title=f"issue #{row['issue_number']}",
@@ -202,10 +226,29 @@ def cmd_prepare(db: Database, config: Config) -> int:
         issue_number=row["issue_number"],
         issue_url=row["issue_url"],
         stack=row["stack"],
-        work_root=Path.home() / ".outreach-agent" / "work",
+        work_root=work_root,
     )
     print(f"prepare: {result.state} — {result.detail}")
-    return 0 if result.state == State.CI_GREEN else 1
+    if result.state != State.CI_GREEN or result.prepared is None:
+        return 1
+
+    # GAP-3: ci-green → draft-on-fork. submit_for_approval owns the branch
+    # push (publisher.py — prep never pushes, so no double-push) and the
+    # intra-fork draft PR. The draft's base is the FORK's actual default
+    # branch (I-1 follow-up: never assume "main"), resolved via the C5 read.
+    fork_default_branch = gateway.get_repo_default_branch(login, repo)
+    draft_pr_number = submit_for_approval(
+        db=db, store=store, gateway=gateway, git=git, config=config,
+        contribution_id=contribution_id,
+        prepared=result.prepared,
+        fork_full_name=fork_full_name,
+        fork_default_branch=fork_default_branch,
+        upstream_full_name=row["repo_full_name"],
+        work_dir=work_root / contribution_id,
+    )
+    print(f"draft-on-fork: PR #{draft_pr_number} on {fork_full_name} "
+          f"(base {fork_default_branch}) — review and approve on GitHub (C4)")
+    return 0
 
 
 def _build_llm(db: Database, config: Config) -> Any:
@@ -219,13 +262,26 @@ def _build_llm(db: Database, config: Config) -> Any:
 
 def cmd_approve_sync(db: Database, config: Config) -> int:
     from .policy import recheck_policy
-    from .publisher import sync_approval, sync_outcome
+    from .publisher import run_graph_verification, sync_approval, sync_outcome
     from .review_monitor import pending_review_drafts, run_review_monitor
 
     gateway = _build_gateway(db, config)
     store = ContributionStore(db)
     login = _resolve_login(db)
     handled = 0
+
+    # I-1 (audit step 6): never assume "main" — resolve each upstream repo's
+    # actual default branch via the C5 read, cached per repo within this run
+    # so N drafts on the same repo cost a single lookup.
+    default_branch_cache: dict[str, str] = {}
+
+    def _upstream_default_branch(repo_full_name: str) -> str:
+        if repo_full_name not in default_branch_cache:
+            owner, repo = repo_full_name.split("/", 1)
+            default_branch_cache[repo_full_name] = (
+                gateway.get_repo_default_branch(owner, repo)
+            )
+        return default_branch_cache[repo_full_name]
 
     for row in db.conn.execute(
         "SELECT * FROM contributions WHERE state='draft-on-fork'"
@@ -238,7 +294,7 @@ def cmd_approve_sync(db: Database, config: Config) -> int:
             fork_full_name=row["fork_full_name"],
             draft_pr_number=row["fork_draft_pr_number"],
             upstream_full_name=row["repo_full_name"],
-            upstream_base_branch="main",
+            upstream_base_branch=_upstream_default_branch(row["repo_full_name"]),
             prepared_title=prepared.get("title", ""),
             prepared_body=prepared.get("body_md", ""),
             head_branch=row["branch"],
@@ -278,6 +334,53 @@ def cmd_approve_sync(db: Database, config: Config) -> int:
         else:
             print(f"  {row['contribution_id']}: now {state}")
         handled += 1
+
+    # GAP-4: §6 graph-verify execution — run_graph_verification previously had
+    # no production caller. It self-enforces the verify-after time (merged_at
+    # + graph_verify_delay_h, the persistence shape sync_outcome wrote on
+    # merge detection) and returns GRAPH_VERIFY when not yet due. A row still
+    # in 'merged' means the merged→graph-verify transition did not land
+    # (crash between the two transitions) — normalize it first, per §6.
+    gv_rows = db.conn.execute(
+        "SELECT * FROM contributions WHERE state IN ('merged','graph-verify')"
+    ).fetchall()
+    if gv_rows:
+        user_emails = {
+            e.strip().lower()
+            for e in (db.get_meta("user_emails") or "").replace(";", ",").split(",")
+            if e.strip()
+        }
+        if not user_emails:
+            # No verdict without ground truth: matching against a guessed
+            # email set would mis-record graph-credited/graph-missing.
+            print(f"graph-verify: {len(gv_rows)} contribution(s) pending but"
+                  " config_meta 'user_emails' is not set — skipped. Store your"
+                  " connected/noreply emails (comma-separated) under the"
+                  " 'user_emails' key in config_meta.")
+            with db.transaction():
+                db.append_audit(
+                    actor="agent", phase="info", endpoint="graph-verify:skipped",
+                    outcome={"reason": "user_emails meta not set",
+                             "pending": len(gv_rows)},
+                )
+        else:
+            for row in gv_rows:
+                cid = row["contribution_id"]
+                if row["state"] == State.MERGED.value:
+                    store.transition(
+                        cid, State.GRAPH_VERIFY,
+                        reason="resuming scheduled graph-verify (crash recovery)",
+                    )
+                state = run_graph_verification(
+                    db=db, store=store, gateway=gateway, config=config,
+                    contribution_id=cid,
+                    upstream_full_name=row["repo_full_name"],
+                    upstream_pr_number=row["upstream_pr_number"],
+                    default_branch=_upstream_default_branch(row["repo_full_name"]),
+                    user_emails=user_emails,
+                )
+                print(f"  {cid}: graph-verify — now {state}")
+                handled += 1
 
     drafts = pending_review_drafts(db)
     if drafts:
@@ -320,11 +423,17 @@ def cmd_profile(db: Database, config: Config) -> int:
 
 def cmd_auth_login(db: Database, config: Config) -> int:
     from .oauth import run_login_flow
-    from .tokens import KeyringTokenSource, exchange_oauth_code
+    from .tokens import KeyringTokenSource, exchange_oauth_code, fetch_login
 
     tokens = KeyringTokenSource()
     client_id = tokens.oauth_client_id()
     client_secret = tokens.oauth_client_secret()
+    minted: dict[str, str] = {}
+
+    def _store(token: str) -> None:
+        tokens.store_github_token(token)
+        minted["token"] = token
+
     run_login_flow(
         config=config,
         client_id=client_id,
@@ -333,9 +442,20 @@ def cmd_auth_login(db: Database, config: Config) -> int:
             code_verifier=code_verifier, redirect_uri=redirect_uri,
         ),
         open_browser=lambda url: webbrowser.open(url),
-        store_token=tokens.store_github_token,
+        store_token=_store,
     )
     print("GitHub token stored in Windows Credential Manager (NFR-3).")
+    # GAP-2: resolve and persist github_login — _resolve_login() depends on
+    # this meta key, and `auth login` previously never wrote it. set_meta is
+    # an upsert, so a manual bootstrap row is overwritten cleanly.
+    login = fetch_login(minted["token"])
+    with db.transaction():
+        db.set_meta("github_login", login)
+        db.append_audit(
+            actor="user", phase="info", endpoint="cli:auth-login",
+            outcome={"github_login": login},
+        )
+    print(f"github_login set to {login!r} (config_meta).")
     return 0
 
 

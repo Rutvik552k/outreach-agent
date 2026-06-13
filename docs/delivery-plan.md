@@ -302,11 +302,30 @@ Windows cp1252 → UnicodeDecodeError on docker UTF-8 pull output; now
 (python/nodejs/rust green in real containers, hang→TIMEOUT verdict at wall
 clock, network-none proof). Default lane: **791 passed, 1 skipped**.
 
-## Next actions — MVP build chain COMPLETE; remaining items need user
+### Publish + R-1 — DONE (2026-06-12)
 
-1. Register personal GitHub OAuth App (callback http://127.0.0.1/callback);
-   store client id/secret per README → unlocks `auth login` + live-smoke.
-2. Approve `git init` + first commit + GitHub push → activates CI, R-1
-   (SHA-pin actions, branch protection), v0.1.0 tag.
-3. Live-pilot gate after that: live-smoke lane (AC-1/4/5), I-1 fix
-   (upstream_base_branch hardcode), SBOM.
+- NFR-7 added (user decision): Claude Code CLI = default LLM backend
+  (subscription, no API key); Anthropic API = opt-in. 806 tests.
+- OAuth App registered (Ov23...; first attempt was a GitHub App — Iv23
+  prefix — caught and re-registered), creds in keyring, `auth login` done,
+  token `gho_` present (public_repo + user:email).
+- Repo live: github.com/Rutvik552k/outreach-agent (public), main +
+  v0.1.0 tag pushed (3 commits). Agent token CANNOT push workflow files
+  (V3 working as designed) → one-time broad classic PAT used for
+  bootstrap; PAT removed from keyring; **user must delete it on GitHub**.
+- R-1 CLOSED: actions SHA-pinned (checkout v4.3.1, setup-python v5.6.0,
+  resolved via API), branch protection on main: both CI jobs required
+  status checks, strict, enforce_admins, no force-push/deletions.
+- **CI BLOCKED — account-level**: "account is locked due to a billing
+  issue" — GitHub Actions won't start any job. User must resolve at
+  github.com/settings/billing, then re-run. Not a code failure.
+
+## Next actions
+
+1. USER: delete bootstrap PAT on GitHub (broad scopes); fix billing lock;
+   re-run CI (expect both jobs green = H-2 enforcement live).
+2. Live-smoke lane (AC-1/4/5): real discovery run, one end-to-end PR to a
+   user-owned repo, graph-credit verification. I-1 fix
+   (upstream_base_branch hardcode) before first real upstream PR.
+3. Optional hygiene: regenerate OAuth client secret (was pasted in chat),
+   re-store via keyring.

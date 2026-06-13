@@ -69,6 +69,7 @@ class FakeGitHubClient:
         self.branch_commits: list[dict[str, Any]] = []
         self.search_results: list[dict[str, Any]] = []
         self.repo_files: dict[str, str] = {}  # "owner/repo/path" -> content
+        self.default_branches: dict[str, str] = {}  # "owner/repo" -> branch ("main" if unset)
         self.review_comments: list[dict[str, Any]] = []
         self.pr_reviews: list[dict[str, Any]] = []
         self.own_repos: list[dict[str, Any]] = []
@@ -143,6 +144,10 @@ class FakeGitHubClient:
     def get_repo_file(self, owner, repo, path):
         self._record("get_repo_file", owner, repo, path)
         return self.repo_files.get(f"{owner}/{repo}/{path}")
+
+    def get_repo_default_branch(self, owner, repo):
+        self._record("get_repo_default_branch", owner, repo)
+        return self.default_branches.get(f"{owner}/{repo}", "main")
 
     def rate_headers(self):
         return (4999, 1760000000)

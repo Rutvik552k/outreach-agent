@@ -254,6 +254,12 @@ EXPECTED_READS = {
     # - list_own_repos: profile-growth repo data (§2[7]),
     #   GET /user/repos (githubkit rest/repos.py:21979).
     "list_pr_reviews", "list_own_repos",
+    # I-1 fix (audit step 6) deliberate addition, re-reviewed against C4 v2.1 —
+    # READ ONLY, no label or approval capability added:
+    # - get_repo_default_branch: upstream PR base resolution so approve-sync
+    #   never assumes "main"; GET /repos/{owner}/{repo} → default_branch
+    #   (githubkit 0.15.5 rest/repos.py:1529, models/group_0187.py:93).
+    "get_repo_default_branch",
 }
 
 

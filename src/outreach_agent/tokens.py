@@ -1,9 +1,13 @@
-"""Token source seam (NFR-3) + OAuth token exchange.
+"""Token source seam (NFR-3) + OAuth token exchange + login resolution.
 
 keyring (Windows Credential Manager) backs the production source. The token
 exchange lives HERE (not oauth.py) because this module is on the C-1 HTTP
-client allowlist; it talks only to GitHub's OAuth token endpoint, never the
-REST API (that is C5's exclusive surface).
+client allowlist; it talks to GitHub's OAuth token endpoint plus exactly ONE
+REST read — ``GET /user`` in :func:`fetch_login` (GAP-2). The C5 gateway
+cannot serve that read: constructing the gateway requires the resolved login
+(``agent_login``/``fork_owner``), which is exactly what ``auth login`` is
+trying to learn — a bootstrap chicken-and-egg. Every OTHER REST call remains
+C5's exclusive surface.
 """
 
 from __future__ import annotations
@@ -15,6 +19,7 @@ from .outbound_safety import register_secret_value
 
 SERVICE_NAME = "outreach-agent"
 TOKEN_ENDPOINT = "https://github.com/login/oauth/access_token"
+USER_ENDPOINT = "https://api.github.com/user"
 
 # DEF-002: per-credential remediation. Each entry points at the step that
 # actually produces the credential — never at re-running the command that just
@@ -129,6 +134,48 @@ def exchange_oauth_code(
         raise OAuthError(f"token exchange failed: {payload.get('error', 'no token')}")
     register_secret_value(str(token))  # M-1: registered at mint, not just at store
     return str(token)
+
+
+def fetch_login(token: str, *, timeout_s: float = 30.0) -> str:
+    """GAP-2: resolve the authenticated user's login for ``auth login``.
+
+    ``GET /user`` returns the account's ``login`` (ground truth: githubkit
+    0.15.5 installed source — rest/users.py:87-98 ``users/get-authenticated``
+    → ``GET /user``; models/group_0470.py:28 ``login: str = Field()``).
+    Bearer auth, explicit timeout, typed OAuthError on any failure so the
+    CLI's sanitized handler prints one line — never a traceback, never the
+    token.
+    """
+    import httpx
+
+    try:
+        resp = httpx.get(
+            USER_ENDPOINT,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            timeout=timeout_s,
+        )
+    except httpx.HTTPError as exc:
+        raise OAuthError(
+            f"login resolution failed: GET /user transport error "
+            f"({type(exc).__name__})"
+        ) from exc
+    if resp.status_code != 200:
+        raise OAuthError(
+            f"login resolution failed: GET /user returned {resp.status_code}"
+        )
+    try:
+        login = resp.json().get("login")
+    except ValueError as exc:
+        raise OAuthError(
+            "login resolution failed: GET /user returned non-JSON body"
+        ) from exc
+    if not login:
+        raise OAuthError("login resolution failed: GET /user response has no login")
+    return str(login)
 
 
 class StaticTokenSource:

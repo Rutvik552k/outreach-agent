@@ -234,7 +234,10 @@ def sync_outcome(
     owner, repo = upstream_full_name.split("/", 1)
     try:
         pr = gateway.get_pr(owner, repo, upstream_pr_number)
-    except Exception as exc:  # reads are unwrapped client errors
+    except Exception as exc:
+        # C5 reads raise typed GitHubReadError (GAP-1) whose detail embeds the
+        # githubkit repr — RequestFailed carries the status code, so the F-11
+        # marker check below still sees 403/404/422.
         if any(m in str(exc) for m in _UNAVAILABLE_MARKERS):
             store.transition(contribution_id, State.UPSTREAM_UNAVAILABLE,
                              reason=f"upstream PR fetch failed: {exc} (F-11)")

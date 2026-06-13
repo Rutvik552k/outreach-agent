@@ -14,6 +14,7 @@ Ground sources:
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
 
@@ -22,11 +23,17 @@ from .config import Config
 from .errors import (
     BudgetDeniedError,
     GitHubMutationError,
+    GitHubReadError,
     IntraForkInvariantError,
     StructuralIncapabilityError,
 )
 from .outbound_safety import normalize_outbound_text
 from .persistence import Database
+
+# GAP-1(c): short backoff before the single idempotent-read retry on the
+# RequestTimeout class (resilience rule: max sensible, not a storm).
+# Module-level so tests can zero it via monkeypatch.
+_READ_RETRY_BACKOFF_S = 2.0
 
 
 @dataclass(frozen=True)
@@ -68,6 +75,7 @@ class GitHubClient(Protocol):
                      per_page: int) -> list[dict[str, Any]]: ...
     def search_issues(self, query: str) -> list[dict[str, Any]]: ...
     def get_repo_file(self, owner: str, repo: str, path: str) -> str | None: ...
+    def get_repo_default_branch(self, owner: str, repo: str) -> str: ...
     def rate_headers(self) -> tuple[int | None, int | None]: ...
 
 
@@ -204,6 +212,15 @@ class GithubkitClient:
             return None
         return base64.b64decode(content).decode("utf-8", errors="replace")
 
+    def get_repo_default_branch(self, owner: str, repo: str) -> str:
+        """GET /repos/{owner}/{repo} → FullRepository.default_branch (I-1 fix:
+        the upstream PR base must be the repo's ACTUAL default branch, never an
+        assumed "main"). Ground source: githubkit 0.15.5 installed source —
+        rest/repos.py:1529 (`repos.get` → Response[FullRepository]),
+        models/group_0187.py:93 (`default_branch: str = Field()`)."""
+        resp = self._capture(self._gh.rest.repos.get(owner, repo))
+        return resp.parsed_data.default_branch
+
     def rate_headers(self) -> tuple[int | None, int | None]:
         rem = self._last_headers.get("x-ratelimit-remaining")
         reset = self._last_headers.get("x-ratelimit-reset")
@@ -283,41 +300,96 @@ class GitHubGateway:
         return result
 
     # -- reads ----------------------------------------------------------------
+    #
+    # GAP-1 (live-smoke): every read goes through _read(), which converts
+    # githubkit transport errors into the typed, retriable GitHubReadError and
+    # gives the timeout class exactly ONE retry with a short backoff (reads
+    # are idempotent — one retry, never a storm). Ground truth: githubkit
+    # 0.15.5 installed source, core.py:344-350 (sync `_request`:
+    # httpx.TimeoutException → RequestTimeout, any other transport error →
+    # RequestError) and response.py:103-106 (same wrapping on the parse path);
+    # RequestFailed/RequestTimeout are RequestError subclasses
+    # (exception.py:39,53).
+
+    def _read(self, what: str, call: Callable[[], Any]) -> Any:
+        """Wrap a C5 read. Lazy exception import keeps the mocked CI lane's
+        module-import path transport-free, matching GithubkitClient."""
+        from githubkit.exception import RequestError, RequestTimeout
+
+        try:
+            return call()
+        except RequestTimeout:
+            time.sleep(_READ_RETRY_BACKOFF_S)
+            try:
+                return call()
+            except RequestError as exc:
+                raise GitHubReadError(
+                    f"{what} failed after one retry: {exc!r}"
+                ) from exc
+        except RequestError as exc:
+            raise GitHubReadError(f"{what} failed: {exc!r}") from exc
 
     def search_issues(self, query: str) -> list[dict[str, Any]]:
-        return self.client.search_issues(query)
+        return self._read("search issues",
+                          lambda: self.client.search_issues(query))
 
     def get_pr(self, owner: str, repo: str, pull_number: int) -> PullRef:
-        return self.client.get_pull(owner, repo, pull_number)
+        return self._read(
+            f"get PR {owner}/{repo}#{pull_number}",
+            lambda: self.client.get_pull(owner, repo, pull_number))
 
     def list_review_comments(self, owner: str, repo: str,
                              pull_number: int) -> list[dict[str, Any]]:
-        return self.client.list_review_comments(owner, repo, pull_number)
+        return self._read(
+            f"list review comments {owner}/{repo}#{pull_number}",
+            lambda: self.client.list_review_comments(owner, repo, pull_number))
 
     def list_pr_reviews(self, owner: str, repo: str,
                         pull_number: int) -> list[dict[str, Any]]:
         """Review states for changes-requested detection (§2[6], §6 re-entry)."""
-        return self.client.list_pr_reviews(owner, repo, pull_number)
+        return self._read(
+            f"list PR reviews {owner}/{repo}#{pull_number}",
+            lambda: self.client.list_pr_reviews(owner, repo, pull_number))
 
     def list_own_repos(self) -> list[dict[str, Any]]:
         """Profile-Growth Engine read (§2[7]): the user's own repos only."""
-        return self.client.list_repos_for_authenticated_user(
-            type="owner", sort="pushed", per_page=100,
-        )
+        return self._read(
+            "list own repos",
+            lambda: self.client.list_repos_for_authenticated_user(
+                type="owner", sort="pushed", per_page=100,
+            ))
 
     def get_commit(self, owner: str, repo: str, ref: str) -> dict[str, Any]:
-        return self.client.get_commit(owner, repo, ref)
+        return self._read(
+            f"get commit {owner}/{repo}@{ref[:12]}",
+            lambda: self.client.get_commit(owner, repo, ref))
 
     def list_commits(self, owner: str, repo: str, *, sha: str,
                      per_page: int = 50) -> list[dict[str, Any]]:
-        return self.client.list_commits(owner, repo, sha=sha, per_page=per_page)
+        return self._read(
+            f"list commits {owner}/{repo}@{sha}",
+            lambda: self.client.list_commits(owner, repo, sha=sha,
+                                             per_page=per_page))
 
     def get_timeline_events(self, owner: str, repo: str,
                             issue_number: int) -> list[dict[str, Any]]:
-        return self.client.list_timeline_events(owner, repo, issue_number)
+        return self._read(
+            f"get timeline {owner}/{repo}#{issue_number}",
+            lambda: self.client.list_timeline_events(owner, repo, issue_number))
 
     def get_repo_file(self, owner: str, repo: str, path: str) -> str | None:
-        return self.client.get_repo_file(owner, repo, path)
+        return self._read(
+            f"get file {owner}/{repo}:{path}",
+            lambda: self.client.get_repo_file(owner, repo, path))
+
+    def get_repo_default_branch(self, owner: str, repo: str) -> str:
+        """I-1 (audit step 6): resolve the repo's actual default branch for the
+        upstream PR base — repos with master/develop/trunk defaults would
+        otherwise get a PR against a wrong or nonexistent base. READ only —
+        no budget/audit, matching the other gateway reads."""
+        return self._read(
+            f"get default branch {owner}/{repo}",
+            lambda: self.client.get_repo_default_branch(owner, repo))
 
     # -- idempotency read-check (FM1: never retry a mutation blind) -----------
 

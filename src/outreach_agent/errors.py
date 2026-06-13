@@ -100,6 +100,24 @@ class DiffInvariantError(OutreachError):
     source_component = "diff_checks"
 
 
+class GitHubReadError(OutreachError):
+    """A C5 gateway READ failed at the transport layer (GAP-1, live-smoke).
+
+    githubkit wraps httpx.TimeoutException into RequestTimeout and every other
+    transport error into RequestError (githubkit 0.15.5 core.py:344-350); the
+    gateway converts both into this typed, retriable error so a slow
+    CONTRIBUTING.md fetch surfaces as one sanitized line — never a raw
+    githubkit traceback. ``detail`` embeds the githubkit repr, which carries
+    the HTTP status for RequestFailed, so the F-11 status-marker check in
+    publisher.sync_outcome keeps working.
+    """
+
+    type_uri = "urn:outreach-agent:error:github-read"
+    title = "GitHub read failed (transient transport error)"
+    retriable = True
+    source_component = "github_gateway"
+
+
 class GitHubMutationError(OutreachError):
     type_uri = "urn:outreach-agent:error:github-mutation"
     title = "GitHub mutation failed"
